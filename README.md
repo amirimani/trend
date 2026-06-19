@@ -218,6 +218,14 @@ docker compose up -d --build  # builds the image and starts the monitor
 docker compose logs -f        # watch it; you'll get a "bot activated" message
 ```
 
+After later `git pull`s, reconcile your `.env` with any new settings without
+losing your values:
+
+```bash
+./sync_env.sh --check   # show which new variables are missing
+./sync_env.sh           # add them (with defaults; your existing values kept, backup made)
+```
+
 Get a bot token from **@BotFather** and your chat id from **@userinfobot**. Set
 the initial `WATCHLIST` in `.env`; afterwards manage coins live from Telegram.
 The service:
