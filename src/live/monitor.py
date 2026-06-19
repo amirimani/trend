@@ -146,6 +146,19 @@ class Context:
         threading.Thread(target=_backtest_worker, args=(self, symbol), daemon=True).start()
         return f"🧪 بک‌تست `{symbol}` شروع شد؛ نتیجه و نمودار به‌زودی می‌آید…"
 
+    def start_backtest_all(self) -> str:
+        """Run a chart backtest for every coin in the watchlist (one worker each)."""
+        syms = list(st.watchlist(self.state))
+        started = [s for s in syms if s not in self.backtesting]
+        for s in started:
+            self.backtesting.add(s)
+            threading.Thread(target=_backtest_worker, args=(self, s), daemon=True).start()
+        if not started:
+            return "ارزی برای بک‌تست نیست (یا همه در حال اجرا)."
+        return ("📈 بک‌تست نموداری همهٔ ارزها شروع شد:\n"
+                + "، ".join(f"`{s}`" for s in started)
+                + "\nنمودارها به‌ترتیب آماده‌شدن ارسال می‌شوند…")
+
 
 # --------------------------------------------------------------------------- #
 # Signal evaluation on a single closed bar
