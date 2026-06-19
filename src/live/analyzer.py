@@ -27,7 +27,7 @@ def run_analysis(symbol: str, fetch_fn, timeframe: str = "4h",
         raise ValueError(
             f"دادهٔ کافی برای {symbol} نیست (فقط {0 if df is None else len(df)} کندل)."
         )
-    summary = analyze_symbol(df, costs=costs)
+    summary = analyze_symbol(df, costs=costs, timeframe=timeframe)
     summary["symbol"] = symbol
     summary["timeframe"] = timeframe
     return summary

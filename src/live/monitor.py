@@ -38,6 +38,7 @@ from src.live.analyzer import run_analysis
 from src.live.feed import fetch_history, fetch_recent
 from src.live.notifier import TelegramNotifier
 from src.live import state as st
+from src.metrics import periods_per_year, timeframe_hours
 from src.position import open_position, step
 from src.strategy import Params, generate_signals
 
@@ -291,7 +292,7 @@ def format_partial(pos: dict, leg: dict, pct: float, r: float, symbol: str, time
 
 
 def format_result(trade: dict, symbol: str, timeframe: str) -> str:
-    days = trade["bars"] * 4 / 24
+    days = trade["bars"] * timeframe_hours(timeframe) / 24
     win = trade["pnl_pct"] >= 0
     return (
         f"{'✅' if win else '❌'} *نتیجهٔ پوزیشن {trade['side']} بسته شد* — `{symbol}` {timeframe}\n"
@@ -414,7 +415,8 @@ def _process_bars(entry: dict, sig, p: Params, notifier, symbol: str, timeframe:
                 if leg["reason"] == "TP1" and pos["remaining"] > 1e-12:
                     notifier.send(format_partial(pos, leg, pct, r, symbol, timeframe))
             if pos["remaining"] <= 1e-12:   # fully closed -> record + report
-                bars = max(1, round((ts - pd.Timestamp(pos["entry_time"])).total_seconds() / (4 * 3600)))
+                hours = timeframe_hours(timeframe)
+                bars = max(1, round((ts - pd.Timestamp(pos["entry_time"])).total_seconds() / (hours * 3600)))
                 trade = {
                     "side": pos["side_str"], "entry": pos["entry"],
                     "exit": pos["_last_price"], "reason": pos["_last_reason"],
@@ -586,8 +588,9 @@ def _backtest_worker(ctx: Context, symbol: str) -> None:
         if df is None or len(df) < 250:
             raise ValueError("دادهٔ کافی نیست")
         res = run_backtest(df, p, Costs())
-        m = compute_metrics(res.equity, res.trades)
-        bnh = compute_metrics(res.bnh_equity, [])
+        ppy = periods_per_year(ctx.timeframe)
+        m = compute_metrics(res.equity, res.trades, ppy=ppy)
+        bnh = compute_metrics(res.bnh_equity, [], ppy=ppy)
         caption = _backtest_caption(symbol, p, m, bnh, df, ctx.timeframe)
         png = _plot_equity(symbol, res, ctx.timeframe)
         if png:
@@ -751,6 +754,15 @@ def build_context() -> Context:
     existed = raw.get("version") == 2 and "watchlist" in raw
     state = st.migrate(raw, st.normalize_symbol(WATCHLIST_SEED[0]),
                        default_p, seed_symbols=WATCHLIST_SEED)
+    # If the timeframe changed (e.g. 4h -> 1d), reset per-symbol bar tracking and
+    # open positions (they belong to the old timeframe); params/history are kept.
+    if state.get("timeframe") and state.get("timeframe") != TIMEFRAME:
+        for e in st.watchlist(state).values():
+            e["last_bar"] = None
+            e["position"] = None
+        log.info("Timeframe changed %s -> %s: reset bar tracking & open positions.",
+                 state.get("timeframe"), TIMEFRAME)
+    state["timeframe"] = TIMEFRAME
     try:
         st.save_state(state)
     except OSError as e:
