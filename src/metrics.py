@@ -4,8 +4,20 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# 4h bars: 6 per day. Use 365.25 days/yr for annualisation.
+# Default: 4h bars (6 per day). Use 365.25 days/yr for annualisation.
 BARS_PER_YEAR = 6 * 365.25
+
+
+def timeframe_hours(tf: str) -> float:
+    """Hours per bar for a ccxt timeframe string ('15m','1h','4h','1d','1w')."""
+    tf = (tf or "4h").strip().lower()
+    unit = {"m": 1 / 60.0, "h": 1.0, "d": 24.0, "w": 168.0}.get(tf[-1], 1.0)
+    digits = "".join(c for c in tf if c.isdigit())
+    return (int(digits) if digits else 1) * unit
+
+
+def periods_per_year(tf: str) -> float:
+    return (365.25 * 24.0) / timeframe_hours(tf)
 
 
 def _max_drawdown(equity: pd.Series) -> float:
@@ -14,7 +26,8 @@ def _max_drawdown(equity: pd.Series) -> float:
     return float(dd.min())
 
 
-def compute_metrics(equity: pd.Series, trades: list, rf: float = 0.0) -> dict:
+def compute_metrics(equity: pd.Series, trades: list, rf: float = 0.0,
+                    ppy: float = BARS_PER_YEAR) -> dict:
     eq = equity.dropna()
     rets = eq.pct_change().dropna()
 
@@ -23,13 +36,11 @@ def compute_metrics(equity: pd.Series, trades: list, rf: float = 0.0) -> dict:
     cagr = float((eq.iloc[-1] / eq.iloc[0]) ** (1.0 / years) - 1.0) if years > 0 else float("nan")
 
     if rets.std(ddof=0) > 0:
-        sharpe = float(
-            (rets.mean() - rf / BARS_PER_YEAR) / rets.std(ddof=0) * np.sqrt(BARS_PER_YEAR)
-        )
+        sharpe = float((rets.mean() - rf / ppy) / rets.std(ddof=0) * np.sqrt(ppy))
         # Standard downside deviation: RMS of negative excess returns over ALL bars.
-        neg = np.minimum(rets - rf / BARS_PER_YEAR, 0.0)
+        neg = np.minimum(rets - rf / ppy, 0.0)
         downside = float(np.sqrt(np.mean(neg ** 2)))
-        sortino = float(rets.mean() / downside * np.sqrt(BARS_PER_YEAR)) if downside > 0 else float("nan")
+        sortino = float(rets.mean() / downside * np.sqrt(ppy)) if downside > 0 else float("nan")
     else:
         sharpe = sortino = float("nan")
 
