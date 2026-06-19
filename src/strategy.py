@@ -29,6 +29,21 @@ class Params:
     atr_tp_mult: float = 4.0   # take-profit distance = atr_tp_mult * ATR
     allow_short: bool = False  # spot BTC: long-only by default
 
+    # ---- Entry options -----------------------------------------------------
+    entry_mode: str = "ema_cross"   # "ema_cross" | "donchian"
+    donchian_period: int = 20       # breakout lookback for donchian entries
+    use_rsi_filter: bool = True     # apply the RSI entry band
+
+    # ---- Trend regime filter ----------------------------------------------
+    regime_filter: bool = False     # only go long above (short below) a long MA
+    regime_ema: int = 200
+
+    # ---- Exit options ------------------------------------------------------
+    exit_mode: str = "fixed"        # "fixed" | "trailing" | "partial"
+    trail_atr_mult: float = 3.0     # trailing-stop distance (trailing/partial)
+    partial_tp_mult: float = 2.0    # first target (R multiple) for partial mode
+    partial_tp_frac: float = 0.5    # fraction closed at the first target
+
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -69,6 +84,12 @@ def add_indicators(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     out["ema_slow"] = ema(out["close"], p.ema_slow)
     out["rsi"] = rsi(out["close"], p.rsi_period)
     out["atr"] = atr(out, p.atr_period)
+    if p.regime_filter:
+        out["regime_ema"] = ema(out["close"], p.regime_ema)
+    if p.entry_mode == "donchian":
+        # Prior N-bar channel (shifted so the current bar isn't included).
+        out["dc_high"] = out["high"].rolling(p.donchian_period).max().shift(1)
+        out["dc_low"] = out["low"].rolling(p.donchian_period).min().shift(1)
     return out
 
 
@@ -92,24 +113,45 @@ def generate_signals(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     cross_up = above & ~above.shift(1, fill_value=False)
     cross_dn = ~above & above.shift(1, fill_value=False)
 
-    rsi_ok_long = (out["rsi"] < p.rsi_long_max) & (out["rsi"] >= p.rsi_long_min)
+    if p.entry_mode == "donchian":
+        # Breakout entries; trend-flip exit on the opposite channel break.
+        long_raw = out["close"] > out["dc_high"]
+        long_flip = out["close"] < out["dc_low"]
+        short_raw = out["close"] < out["dc_low"]
+        short_flip = out["close"] > out["dc_high"]
+    else:  # ema_cross
+        long_raw, long_flip = cross_up, cross_dn
+        short_raw, short_flip = cross_dn, cross_up
 
-    out["long_entry"] = cross_up & rsi_ok_long
-    out["long_exit"] = cross_dn
+    # RSI entry band (optional).
+    if p.use_rsi_filter:
+        rsi_ok_long = (out["rsi"] < p.rsi_long_max) & (out["rsi"] >= p.rsi_long_min)
+        rsi_ok_short = (out["rsi"] > (100.0 - p.rsi_long_max)) & (
+            out["rsi"] <= (100.0 - p.rsi_long_min))
+    else:
+        rsi_ok_long = rsi_ok_short = pd.Series(True, index=out.index)
+
+    # Trend regime filter (optional): only long above / short below the long EMA.
+    if p.regime_filter:
+        regime_long = out["close"] > out["regime_ema"]
+        regime_short = out["close"] < out["regime_ema"]
+    else:
+        regime_long = regime_short = pd.Series(True, index=out.index)
+
+    out["long_entry"] = long_raw & rsi_ok_long & regime_long
+    out["long_exit"] = long_flip
 
     if p.allow_short:
-        rsi_ok_short = (out["rsi"] > (100.0 - p.rsi_long_max)) & (
-            out["rsi"] <= (100.0 - p.rsi_long_min)
-        )
-        out["short_entry"] = cross_dn & rsi_ok_short
-        out["short_exit"] = cross_up
+        out["short_entry"] = short_raw & rsi_ok_short & regime_short
+        out["short_exit"] = short_flip
     else:
         out["short_entry"] = False
         out["short_exit"] = False
 
-    # Indicators are undefined until the slow EMA / ATR warm up; suppress signals
-    # there so we never trade on half-formed indicators.
-    warmup = max(p.ema_slow, p.atr_period, p.rsi_period)
+    # Indicators are undefined until the slow EMA / ATR / channel warm up;
+    # suppress signals there so we never trade on half-formed indicators.
+    warmup = max(p.ema_slow, p.atr_period, p.rsi_period, p.donchian_period,
+                 p.regime_ema if p.regime_filter else 0)
     out.iloc[:warmup, out.columns.get_indexer(
         ["long_entry", "long_exit", "short_entry", "short_exit"]
     )] = False

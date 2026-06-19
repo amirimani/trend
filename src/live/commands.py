@@ -26,6 +26,7 @@ MENU = [
     ("price", "قیمت و اندیکاتورها: /price SOL"),
     ("params", "پارامترهای یک ارز: /params SOL"),
     ("analyze", "بهینه‌سازی پارامترهای یک ارز: /analyze SOL"),
+    ("analyze_all", "تحلیل مجدد همهٔ ارزهای فعال"),
     ("backtest", "بک‌تست و نمودار یک ارز: /backtest SOL"),
     ("report", "نمایش دوبارهٔ نتیجهٔ تحلیل ذخیره‌شده: /report SOL"),
     ("add", "افزودن ارز: /add SOL/USDT"),
@@ -46,7 +47,8 @@ def _btn(text, data):
 def main_menu_kb(ctx) -> dict:
     wl = st.watchlist(ctx.state)
     rows = [[_btn("📋 لیست", "list"), _btn("📅 گزارش هفتگی", "summary")]]
-    rows.append([_btn("⚖️ مقایسهٔ ارزها", "compare")])
+    rows.append([_btn("⚖️ مقایسهٔ ارزها", "compare"),
+                 _btn("🔬 تحلیل مجدد همه", "analyze_all")])
     row = []
     for s in wl:
         flag = "🟢" if wl[s].get("enabled") else "⚪️"
@@ -117,16 +119,26 @@ def _resolve_symbol(ctx, arg):
 
 
 def _position_block(pos, rt):
-    is_long = pos["side"] == "LONG"
-    entry, sl, tp = pos["entry"], pos["sl"], pos["tp"]
-    lines = [
-        f"نوع: *{pos['side']}*  |  ورود: `${_g(entry)}`  ({_dt(pos.get('entry_time'))})",
-        f"🎯 TP `${_g(tp)}`  |  🛑 SL `${_g(sl)}`  |  ⚖️ R/R `{pos.get('rr', float('nan')):.2f}`",
-    ]
+    side = pos.get("side_str") or ("LONG" if pos.get("side") == 1 else "SHORT")
+    is_long = side == "LONG"
+    entry = pos["entry"]
+    stop = pos.get("stop", pos.get("sl"))     # tolerate legacy key
+    tp = pos.get("tp")
+    lines = [f"نوع: *{side}*  |  ورود: `${_g(entry)}`  ({_dt(pos.get('entry_time'))})"]
+    tline = f"🛑 استاپ فعلی `${_g(stop)}`"
+    if tp:
+        tline += f"  |  🎯 هدف `${_g(tp)}`"
+    if pos.get("rr"):
+        tline += f"  |  ⚖️ R/R `{pos['rr']:.2f}`"
+    lines.append(tline)
+    if pos.get("mode") == "partial" and pos.get("partial_done"):
+        lines.append(f"✅ سود جزئی گرفته شد | مابقی `{pos.get('remaining', 1)*100:.0f}%` در حال تریل")
+    elif pos.get("mode") == "trailing" or (pos.get("mode") == "partial"):
+        lines.append("🏃 خروج با تریلینگ‌استاپ (استاپ با روند بالا می‌آید)")
     price = rt.get("price")
     if price:
         upnl = (price / entry - 1) * 100 if is_long else (entry / price - 1) * 100
-        risk = abs(entry - sl)
+        risk = pos.get("risk") or abs(entry - stop)
         cur_r = ((price - entry) if is_long else (entry - price)) / risk if risk > 0 else float("nan")
         lines.append(f"قیمت فعلی `${_g(price)}` → {'🟢' if upnl >= 0 else '🔴'} "
                      f"شناور `{upnl:+.2f}%` (R `{cur_r:+.2f}`)")
@@ -350,6 +362,10 @@ def cmd_analyze(ctx, arg=None):
     return ctx.start_analysis(arg)
 
 
+def cmd_analyze_all(ctx, arg=None):
+    return ctx.start_analysis_all()
+
+
 def cmd_compare(ctx, arg=None):
     """Rank watched coins by their out-of-sample Sharpe to ease selection."""
     wl = st.watchlist(ctx.state)
@@ -438,6 +454,7 @@ _HANDLERS = {
     "stats": cmd_stats, "price": cmd_price, "params": cmd_params, "config": cmd_params,
     "add": cmd_add, "remove": cmd_remove, "delete": cmd_remove,
     "enable": cmd_enable, "disable": cmd_disable, "analyze": cmd_analyze,
+    "analyze_all": cmd_analyze_all, "analyzeall": cmd_analyze_all,
     "backtest": cmd_backtest, "report": cmd_report,
 }
 

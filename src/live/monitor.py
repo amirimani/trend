@@ -38,6 +38,7 @@ from src.live.analyzer import run_analysis
 from src.live.feed import fetch_history, fetch_recent
 from src.live.notifier import TelegramNotifier
 from src.live import state as st
+from src.position import open_position, step
 from src.strategy import Params, generate_signals
 
 logging.basicConfig(
@@ -122,6 +123,19 @@ class Context:
         threading.Thread(target=_analysis_worker, args=(self, symbol, auto), daemon=True).start()
         return f"🔬 تحلیل `{symbol}` شروع شد؛ نتیجه را به‌زودی می‌فرستم…"
 
+    def start_analysis_all(self) -> str:
+        """Queue auto-tuning for every enabled coin (staggered, one worker each)."""
+        syms = [s for s, e in st.watchlist(self.state).items() if e.get("enabled")]
+        started = [s for s in syms if s not in self.analyzing]
+        for s in started:
+            self.analyzing.add(s)
+            threading.Thread(target=_analysis_worker, args=(self, s, False), daemon=True).start()
+        if not started:
+            return "هیچ ارز فعالی برای تحلیل نیست (یا همه در حال تحلیل‌اند)."
+        return ("🔬 تحلیل مجدد همهٔ ارزهای فعال شروع شد:\n"
+                + "، ".join(f"`{s}`" for s in started)
+                + "\nنتایج به‌ترتیب آماده‌شدن ارسال می‌شوند…")
+
     def start_backtest(self, symbol: str) -> str:
         symbol = st.normalize_symbol(symbol)
         if symbol not in st.watchlist(self.state):
@@ -145,17 +159,22 @@ def signal_from_row(row, ts, p: Params, alert_on_exit: bool = True) -> dict | No
     base = {
         "time": ts, "price": price, "atr": atr, "rsi": rsi,
         "ema_fast": float(row["ema_fast"]), "ema_slow": float(row["ema_slow"]),
+        "exit_mode": p.exit_mode, "trail_mult": p.trail_atr_mult,
+        "partial_frac": p.partial_tp_frac,
     }
-    if bool(row["long_entry"]):
-        sl = price - p.atr_sl_mult * atr
-        tp = price + p.atr_tp_mult * atr
-        rr = (tp - price) / (price - sl) if price > sl else float("nan")
-        return {**base, "kind": "entry", "side": "LONG", "sl": sl, "tp": tp, "rr": rr}
-    if p.allow_short and bool(row["short_entry"]):
-        sl = price + p.atr_sl_mult * atr
-        tp = price - p.atr_tp_mult * atr
-        rr = (price - tp) / (sl - price) if sl > price else float("nan")
-        return {**base, "kind": "entry", "side": "SHORT", "sl": sl, "tp": tp, "rr": rr}
+    if bool(row["long_entry"]) or (p.allow_short and bool(row["short_entry"])):
+        is_long = bool(row["long_entry"])
+        side = "LONG" if is_long else "SHORT"
+        sl = price - p.atr_sl_mult * atr if is_long else price + p.atr_sl_mult * atr
+        # Display target depends on the exit style.
+        if p.exit_mode == "fixed":
+            tgt = price + p.atr_tp_mult * atr if is_long else price - p.atr_tp_mult * atr
+        elif p.exit_mode == "partial":
+            tgt = price + p.partial_tp_mult * atr if is_long else price - p.partial_tp_mult * atr
+        else:  # trailing -> no fixed target
+            tgt = None
+        rr = abs(tgt - price) / abs(price - sl) if (tgt and price != sl) else None
+        return {**base, "kind": "entry", "side": side, "sl": sl, "tp": tgt, "rr": rr}
     if alert_on_exit and bool(row["long_exit"]):
         return {**base, "kind": "exit", "side": "LONG"}
     if alert_on_exit and p.allow_short and bool(row["short_exit"]):
@@ -163,48 +182,28 @@ def signal_from_row(row, ts, p: Params, alert_on_exit: bool = True) -> dict | No
     return None
 
 
-def check_exit(pos: dict, row, ts, p: Params) -> dict | None:
-    """Mirror the backtest exit rules (stop-before-target, gap-through at open)."""
-    o, h, l, c = (float(row["open"]), float(row["high"]),
-                  float(row["low"]), float(row["close"]))
-    sl, tp = pos["sl"], pos["tp"]
-    if pos["side"] == "LONG":
-        if l <= sl:
-            return {"exit_price": (o if o <= sl else sl), "reason": "SL", "time": ts}
-        if h >= tp:
-            return {"exit_price": (o if o >= tp else tp), "reason": "TP", "time": ts}
-        if bool(row["long_exit"]):
-            return {"exit_price": c, "reason": "EXIT", "time": ts}
+def _open_live_position(alert: dict, p: Params) -> dict:
+    """Build a persisted position from an entry alert, using the shared module."""
+    side = 1 if alert["side"] == "LONG" else -1
+    pos = open_position(side, alert["price"], alert["atr"], p)
+    pos["side_str"] = alert["side"]
+    pos["entry_time"] = alert["time"].isoformat()
+    pos["rr"] = alert.get("rr")
+    pos["risk"] = abs(alert["price"] - pos["stop"])   # per-unit risk for R calc
+    pos["acc_pct"] = 0.0                               # accumulated realised %
+    pos["acc_r"] = 0.0                                 # accumulated realised R
+    return pos
+
+
+def _leg_pct_r(pos: dict, price: float) -> tuple[float, float]:
+    e = pos["entry"]
+    if pos["side"] == 1:
+        pct = (price / e - 1.0) * 100.0
+        r = (price - e) / pos["risk"] if pos["risk"] > 0 else float("nan")
     else:
-        if h >= sl:
-            return {"exit_price": (o if o >= sl else sl), "reason": "SL", "time": ts}
-        if l <= tp:
-            return {"exit_price": (o if o <= tp else tp), "reason": "TP", "time": ts}
-        if bool(row["short_exit"]):
-            return {"exit_price": c, "reason": "EXIT", "time": ts}
-    return None
-
-
-def realised(pos: dict, ex: dict) -> dict:
-    entry, exit_px = pos["entry"], ex["exit_price"]
-    is_long = pos["side"] == "LONG"
-    pnl_pct = (exit_px / entry - 1.0) * 100.0 if is_long else (entry / exit_px - 1.0) * 100.0
-    risk = abs(entry - pos["sl"])
-    reward = (exit_px - entry) if is_long else (entry - exit_px)
-    r_mult = reward / risk if risk > 0 else float("nan")
-    bars = max(1, round((ex["time"] - pd.Timestamp(pos["entry_time"])).total_seconds() / (4 * 3600)))
-    return {
-        "side": pos["side"], "entry": entry, "exit": exit_px, "reason": ex["reason"],
-        "pnl_pct": pnl_pct, "r": r_mult, "bars": bars,
-        "entry_time": pos["entry_time"], "exit_time": ex["time"].isoformat(),
-    }
-
-
-def _position_dict(alert: dict) -> dict:
-    return {
-        "side": alert["side"], "entry": alert["price"], "sl": alert["sl"],
-        "tp": alert["tp"], "rr": alert["rr"], "entry_time": alert["time"].isoformat(),
-    }
+        pct = (e / price - 1.0) * 100.0
+        r = (e - price) / pos["risk"] if pos["risk"] > 0 else float("nan")
+    return pct, r
 
 
 # --------------------------------------------------------------------------- #
@@ -222,19 +221,30 @@ def fmt_price(x: float) -> str:
     return f"{x:.6f}"
 
 
+_EXIT_DESC = {
+    "fixed": lambda a: f"🎯 حد سود (TP): `${fmt_price(a['tp'])}`  ({(a['tp']/a['price']-1)*100:+.2f}%)\n"
+                       f"⚖️ نسبت R/R: `{a['rr']:.2f}`",
+    "partial": lambda a: f"🎯 هدف اول (بستن {a['partial_frac']*100:.0f}%): `${fmt_price(a['tp'])}`"
+                         f"  ({abs(a['tp']/a['price']-1)*100:+.2f}%)\n"
+                         f"سپس مابقی با تریلینگ‌استاپ `{a['trail_mult']}×ATR` ادامه می‌یابد"
+                         + (f" | R اولیه `{a['rr']:.2f}`" if a.get("rr") else ""),
+    "trailing": lambda a: f"🏃 خروج: تریلینگ‌استاپ `{a['trail_mult']}×ATR` (بدون حد سود ثابت — روند را تا انتها سوار می‌شود)",
+}
+
+
 def format_alert(a: dict, symbol: str, timeframe: str) -> str:
     t = a["time"].strftime("%Y-%m-%d %H:%M UTC")
     is_long = a["side"] == "LONG"
     emoji = "🟢" if is_long else "🔴"
     word = "خرید (LONG)" if is_long else "فروش (SHORT)"
-    entry, sl, tp = a["price"], a["sl"], a["tp"]
+    entry, sl = a["price"], a["sl"]
+    exit_line = _EXIT_DESC.get(a.get("exit_mode", "fixed"), _EXIT_DESC["fixed"])(a)
     return (
         f"{emoji} *سیگنال {word}* — `{symbol}` {timeframe}\n"
         f"⏰ بستن کندل: `{t}`\n\n"
         f"📍 ورود (در بازار/کندل بعد): `${fmt_price(entry)}`\n"
-        f"🎯 حد سود (TP): `${fmt_price(tp)}`  ({(tp/entry-1)*100:+.2f}%)\n"
-        f"🛑 حد ضرر (SL): `${fmt_price(sl)}`  ({(sl/entry-1)*100:+.2f}%)\n"
-        f"⚖️ نسبت R/R: `{a['rr']:.2f}`\n\n"
+        f"{exit_line}\n"
+        f"🛑 حد ضرر (SL): `${fmt_price(sl)}`  ({(sl/entry-1)*100:+.2f}%)\n\n"
         f"RSI: `{a['rsi']:.1f}` | EMA: `{fmt_price(a['ema_fast'])}/{fmt_price(a['ema_slow'])}`\n"
         f"_سیستم هشداردهنده است و سفارش ثبت نمی‌کند._"
     )
@@ -242,23 +252,34 @@ def format_alert(a: dict, symbol: str, timeframe: str) -> str:
 
 _REASON_FA = {
     "TP": "اصابت به حد سود (TP) 🎯",
+    "TP1": "هدف اول (بخشی) 🎯",
     "SL": "اصابت به حد ضرر (SL) 🛑",
-    "EXIT": "فلیپ روند / کراس معکوس EMA ⚪️",
+    "TRAIL": "تریلینگ‌استاپ 🏃",
+    "EXIT": "فلیپ روند / کراس معکوس ⚪️",
 }
 
 
-def format_result(pos: dict, ex: dict, symbol: str, timeframe: str) -> str:
-    r = realised(pos, ex)
-    days = r["bars"] * 4 / 24
-    win = r["pnl_pct"] >= 0
+def format_partial(pos: dict, leg: dict, pct: float, r: float, symbol: str, timeframe: str) -> str:
     return (
-        f"{'✅' if win else '❌'} *نتیجهٔ پوزیشن {pos['side']} بسته شد* — `{symbol}` {timeframe}\n"
-        f"دلیل خروج: {_REASON_FA.get(ex['reason'], ex['reason'])}\n\n"
-        f"📍 ورود: `${fmt_price(r['entry'])}`\n"
-        f"🚪 خروج: `${fmt_price(r['exit'])}`\n"
-        f"💰 {'سود' if win else 'ضرر'}: `{r['pnl_pct']:+.2f}%`  (R: `{r['r']:+.2f}`)\n"
-        f"🕒 مدت نگهداری: `{r['bars']}` کندل (~`{days:.1f}` روز)\n"
-        f"⏰ زمان خروج: `{ex['time'].strftime('%Y-%m-%d %H:%M UTC')}`\n"
+        f"🟡 *سود جزئی گرفته شد* — `{symbol}` {timeframe}\n"
+        f"بستن `{leg['frac']*100:.0f}%` از پوزیشن {pos['side_str']} در `${fmt_price(leg['price'])}`"
+        f"  (`{pct:+.2f}%`، R `{r:+.2f}`)\n"
+        f"مابقی `{pos['remaining']*100:.0f}%` با تریلینگ‌استاپ ادامه دارد؛ "
+        f"استاپ به `${fmt_price(pos['stop'])}` منتقل شد."
+    )
+
+
+def format_result(trade: dict, symbol: str, timeframe: str) -> str:
+    days = trade["bars"] * 4 / 24
+    win = trade["pnl_pct"] >= 0
+    return (
+        f"{'✅' if win else '❌'} *نتیجهٔ پوزیشن {trade['side']} بسته شد* — `{symbol}` {timeframe}\n"
+        f"دلیل خروج نهایی: {_REASON_FA.get(trade['reason'], trade['reason'])}\n\n"
+        f"📍 ورود: `${fmt_price(trade['entry'])}`\n"
+        f"🚪 خروج نهایی: `${fmt_price(trade['exit'])}`\n"
+        f"💰 {'سود' if win else 'ضرر'} کل: `{trade['pnl_pct']:+.2f}%`  (R: `{trade['r']:+.2f}`)\n"
+        f"🕒 مدت نگهداری: `{trade['bars']}` کندل (~`{days:.1f}` روز)\n"
+        f"⏰ زمان خروج: `{pd.Timestamp(trade['exit_time']).strftime('%Y-%m-%d %H:%M UTC')}`\n"
         f"_سود/زیان بر مبنای قیمت و بدون احتساب کارمزد است._"
     )
 
@@ -334,19 +355,41 @@ def _process_bars(entry: dict, sig, p: Params, notifier, symbol: str, timeframe:
     last_seen = pd.Timestamp(entry["last_bar"])
     for ts in sig.index[sig.index > last_seen]:
         row = sig.loc[ts]
+        o, h, l, c = (float(row["open"]), float(row["high"]),
+                      float(row["low"]), float(row["close"]))
         pos = entry.get("position")
+        if pos and "remaining" not in pos:
+            # Legacy position from an older schema (pre-trailing) open during an
+            # upgrade — drop tracking; a fresh signal will re-enter cleanly.
+            entry["position"] = None
+            pos = None
         if pos:
-            ex = check_exit(pos, row, ts, p)
-            if ex is not None:
-                notifier.send(format_result(pos, ex, symbol, timeframe))
-                entry.setdefault("history", []).append(realised(pos, ex))
+            flip = bool(row["long_exit"]) if pos["side"] == 1 else bool(row["short_exit"])
+            for leg in step(pos, o, h, l, c, flip, p):
+                pct, r = _leg_pct_r(pos, leg["price"])
+                pos["acc_pct"] += leg["frac"] * pct
+                pos["acc_r"] += leg["frac"] * r
+                pos["_last_price"] = leg["price"]
+                pos["_last_reason"] = leg["reason"]
+                if leg["reason"] == "TP1" and pos["remaining"] > 1e-12:
+                    notifier.send(format_partial(pos, leg, pct, r, symbol, timeframe))
+            if pos["remaining"] <= 1e-12:   # fully closed -> record + report
+                bars = max(1, round((ts - pd.Timestamp(pos["entry_time"])).total_seconds() / (4 * 3600)))
+                trade = {
+                    "side": pos["side_str"], "entry": pos["entry"],
+                    "exit": pos["_last_price"], "reason": pos["_last_reason"],
+                    "pnl_pct": pos["acc_pct"], "r": pos["acc_r"], "bars": bars,
+                    "entry_time": pos["entry_time"], "exit_time": ts.isoformat(),
+                }
+                notifier.send(format_result(trade, symbol, timeframe))
+                entry.setdefault("history", []).append(trade)
                 entry["history"] = entry["history"][-500:]
                 entry["position"] = None
         if not entry.get("position"):
             s = signal_from_row(row, ts, p, alert_on_exit=False)
             if s and s["kind"] == "entry":
                 notifier.send(format_alert(s, symbol, timeframe))
-                entry["position"] = _position_dict(s)
+                entry["position"] = _open_live_position(s, p)
     entry["last_bar"] = latest_ts.isoformat()
 
 

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .position import open_position, step
 from .strategy import Params, generate_signals
 
 
@@ -74,126 +75,85 @@ def run_backtest(df: pd.DataFrame, p: Params, costs: Costs) -> BacktestResult:
     cash = costs.init_cash
     n = len(df)
 
-    # Position state.
-    in_pos = False
-    side = 0           # +1 long, -1 short
-    qty = 0.0
+    # Position state (supports partial exits via `pos["remaining"]`).
+    pos = None
+    qty0 = 0.0            # units opened at entry (full size)
     entry_price = 0.0
     entry_time = None
     entry_bar = 0
-    sl = tp = 0.0
+    entry_capital = 0.0
+    realized_cash = 0.0   # long: proceeds banked from exited legs
+    realized_pnl = 0.0    # short: pnl banked from covered legs
+    entry_fee = 0.0
+    last_reason = None
 
     equity = np.empty(n, dtype="float64")
     trades: list[Trade] = []
 
-    def buy_fill(price):  # adverse for entering long / covering short
+    def buy_fill(price):   # adverse for entering long / covering short
         return price * (1.0 + slip)
 
     def sell_fill(price):  # adverse for exiting long / entering short
         return price * (1.0 - slip)
 
     for i in range(n):
-        # ---- 1. Handle an open position: check exits on THIS bar -------------
-        if in_pos:
-            exit_price = None
-            reason = None
-
-            if side == 1:  # long: stop below, target above
-                # Pessimistic ordering: stop checked before target.
-                if l[i] <= sl:
-                    # gap-through: fill at open if it opened below the stop
-                    raw = min(o[i], sl) if o[i] <= sl else sl
-                    exit_price = sell_fill(raw)
-                    reason = "stop"
-                elif h[i] >= tp:
-                    raw = max(o[i], tp) if o[i] >= tp else tp
-                    exit_price = sell_fill(raw)
-                    reason = "target"
-            else:          # short: stop above, target below
-                if h[i] >= sl:
-                    raw = max(o[i], sl) if o[i] >= sl else sl
-                    exit_price = buy_fill(raw)
-                    reason = "stop"
-                elif l[i] <= tp:
-                    raw = min(o[i], tp) if o[i] <= tp else tp
-                    exit_price = buy_fill(raw)
-                    reason = "target"
-
-            # Signal-based exit (trend flip) executes at THIS bar's open, but only
-            # if the SL/TP wasn't already hit on this bar.
-            if exit_price is None:
-                flip = long_exit[i] if side == 1 else short_exit[i]
-                if flip:
-                    exit_price = sell_fill(o[i]) if side == 1 else buy_fill(o[i])
-                    reason = "signal"
-
-            if exit_price is not None:
-                if side == 1:
-                    # exit fee already embedded in sell_fill? No - charge here.
-                    cash = qty * exit_price * (1.0 - fee)
+        # ---- 1. Handle an open position: process exit legs on THIS bar -------
+        if pos is not None:
+            flip = bool(long_exit[i]) if pos["side"] == 1 else bool(short_exit[i])
+            for leg in step(pos, o[i], h[i], l[i], c[i], flip, p):
+                units = leg["frac"] * qty0
+                last_reason = leg["reason"]
+                if pos["side"] == 1:
+                    realized_cash += units * sell_fill(leg["price"]) * (1.0 - fee)
                 else:
-                    # close short: pnl = qty*(entry-exit), minus the exit fee.
-                    # (entry fee was deducted from cash at entry.)
-                    exit_fee = qty * exit_price * fee
-                    cash = (
-                        prev_cash_at_entry
-                        + qty * (entry_price - exit_price)
-                        - entry_fee
-                        - exit_fee
-                    )
-                pnl = cash - prev_cash_at_entry
-                net_ret = pnl / prev_cash_at_entry
-                trades.append(
-                    Trade(
-                        side="long" if side == 1 else "short",
-                        entry_time=entry_time,
-                        entry_price=entry_price,
-                        exit_time=idx[i],
-                        exit_price=exit_price,
-                        exit_reason=reason,
-                        ret=net_ret,
-                        pnl=pnl,
-                        bars_held=i - entry_bar,
-                    )
-                )
-                in_pos = False
-                side = 0
-                qty = 0.0
+                    px = buy_fill(leg["price"])
+                    realized_pnl += units * (entry_price - px) - units * px * fee
+            if pos["remaining"] <= 1e-12:    # fully closed -> record the trade
+                if pos["side"] == 1:
+                    cash = realized_cash
+                else:
+                    cash = entry_capital - entry_fee + realized_pnl
+                pnl = cash - entry_capital
+                trades.append(Trade(
+                    side="long" if pos["side"] == 1 else "short",
+                    entry_time=entry_time, entry_price=entry_price,
+                    exit_time=idx[i], exit_price=sell_fill(c[i]) if pos["side"] == 1 else buy_fill(c[i]),
+                    exit_reason=last_reason, ret=pnl / entry_capital, pnl=pnl,
+                    bars_held=i - entry_bar,
+                ))
+                pos = None
 
         # ---- 2. Look for an entry to execute on THIS bar's open --------------
         # Entry signal was generated at bar i-1's close (acted on i's open).
-        if not in_pos and i > 0:
-            want_long = long_entry[i - 1]
-            want_short = short_entry[i - 1] and p.allow_short
+        if pos is None and i > 0:
+            want_long = bool(long_entry[i - 1])
+            want_short = bool(short_entry[i - 1]) and p.allow_short
             a = atr[i - 1]
             if (want_long or want_short) and np.isfinite(a) and a > 0:
-                prev_cash_at_entry = cash
+                entry_capital = cash
                 if want_long:
-                    fill = buy_fill(o[i])
-                    qty = (cash * (1.0 - fee)) / fill  # entry fee embedded
+                    entry_price = buy_fill(o[i])
+                    qty0 = (cash * (1.0 - fee)) / entry_price  # entry fee embedded
                     entry_fee = 0.0
-                    side = 1
-                    sl = fill - p.atr_sl_mult * a
-                    tp = fill + p.atr_tp_mult * a
+                    realized_cash = 0.0
+                    pos = open_position(1, entry_price, a, p)
                 else:
-                    fill = sell_fill(o[i])
-                    qty = cash / fill                  # notional == cash
-                    entry_fee = qty * fill * fee       # charged explicitly
-                    side = -1
-                    sl = fill + p.atr_sl_mult * a
-                    tp = fill - p.atr_tp_mult * a
-                entry_price = fill
+                    entry_price = sell_fill(o[i])
+                    qty0 = cash / entry_price                  # notional == cash
+                    entry_fee = qty0 * entry_price * fee       # charged explicitly
+                    realized_pnl = 0.0
+                    pos = open_position(-1, entry_price, a, p)
                 entry_time = idx[i]
                 entry_bar = i
-                in_pos = True
 
         # ---- 3. Mark-to-market equity at THIS bar's close --------------------
-        if in_pos:
-            if side == 1:
-                equity[i] = qty * c[i]
+        if pos is not None:
+            rem_units = pos["remaining"] * qty0
+            if pos["side"] == 1:
+                equity[i] = realized_cash + rem_units * c[i]
             else:
-                # short: capital base + unrealised pnl - entry fee already paid
-                equity[i] = prev_cash_at_entry + qty * (entry_price - c[i]) - entry_fee
+                equity[i] = (entry_capital - entry_fee + realized_pnl
+                             + rem_units * (entry_price - c[i]))
         else:
             equity[i] = cash
 

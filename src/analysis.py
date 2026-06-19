@@ -15,13 +15,16 @@ from src.backtest import Costs, run_backtest
 from src.metrics import compute_metrics
 from src.strategy import Params
 
-# Default grid for parameter selection. ~32 combinations -> a few seconds.
+# Default grid for parameter selection. It now searches the high-impact
+# strategic choices too: RSI filter on/off, exit style (fixed TP vs trailing
+# stop vs partial+trail), and the trend-regime filter. ~96 combinations.
 DEFAULT_GRID = {
     "ema_fast": [20, 50],
     "ema_slow": [100, 200],
-    "rsi_long_max": [65, 75],
+    "use_rsi_filter": [True, False],
+    "exit_mode": ["fixed", "trailing", "partial"],
+    "regime_filter": [False, True],
     "atr_sl_mult": [1.5, 2.5],
-    "atr_tp_mult": [3.0, 5.0],
 }
 
 
