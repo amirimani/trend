@@ -134,6 +134,25 @@ The open position is persisted in the dedup volume, so the follow-up result is
 sent even if the container restarts between entry and exit. Exit resolution uses
 the same intrabar rules as the backtest (stop-before-target, gap-through at open).
 
+### Interactive Telegram commands
+
+The bot also listens for commands (long-polling `getUpdates` in a background
+thread) and only answers the configured `TELEGRAM_CHAT_ID`. They appear in the
+Telegram "/" menu automatically:
+
+| Command | What it shows |
+|---|---|
+| `/status` | service uptime, last checked candle, current price, open position |
+| `/position` (`/pos`) | open position detail + **floating** P/L and R |
+| `/stats` | all closed trades: count, win rate, total/avg R, best/worst, exit breakdown |
+| `/history [n]` | last *n* closed trades (default 5, max 20) |
+| `/price` | latest price, RSI, ATR, EMAs and trend |
+| `/params` (`/config`) | the active strategy parameters |
+| `/help` | command list |
+
+Closed trades are stored in the persisted state (`history`), so `/stats` and
+`/history` survive restarts.
+
 ### Deploy on your Hetzner Docker host
 
 ```bash
@@ -171,8 +190,9 @@ src/fetch_binance.py  OPTIONAL genuine Binance BTC/USDT loader (ccxt)
 run_backtest.py     orchestration: IS/OOS split, grid search, reporting, plots
 
 src/live/feed.py      live recent-candle feed from Binance (ccxt), drops open bar
-src/live/notifier.py  Telegram Bot-API notifier (dry-run prints if unconfigured)
-src/live/monitor.py   polling loop: entry alert -> position tracking -> P/L result
+src/live/notifier.py  Telegram Bot-API: send + getUpdates + setMyCommands
+src/live/commands.py  /status /position /stats /history /price /params handlers
+src/live/monitor.py   polling loop + command listener thread; alert -> track -> P/L
 Dockerfile            image for the live monitoring service
 docker-compose.yml    one-command deploy (volume for dedup state, auto-restart)
 .env.example          configuration template

@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -215,19 +216,35 @@ _REASON_FA = {
 }
 
 
-def format_result(pos: dict, ex: dict, symbol: str, timeframe: str) -> str:
-    """Announce the realised P/L of a closed position."""
+def realised(pos: dict, ex: dict) -> dict:
+    """Compute the realised P/L of a closed position (shared by alerts + stats)."""
     entry = pos["entry"]
     exit_px = ex["exit_price"]
     is_long = pos["side"] == "LONG"
-
     pnl_pct = (exit_px / entry - 1.0) * 100.0 if is_long else (entry / exit_px - 1.0) * 100.0
     risk = abs(entry - pos["sl"])
     reward = (exit_px - entry) if is_long else (entry - exit_px)
     r_mult = reward / risk if risk > 0 else float("nan")
-
     entry_ts = pd.Timestamp(pos["entry_time"])
     bars = max(1, round((ex["time"] - entry_ts).total_seconds() / (4 * 3600)))
+    return {
+        "side": pos["side"],
+        "entry": entry,
+        "exit": exit_px,
+        "reason": ex["reason"],
+        "pnl_pct": pnl_pct,
+        "r": r_mult,
+        "bars": bars,
+        "entry_time": pos["entry_time"],
+        "exit_time": ex["time"].isoformat(),
+    }
+
+
+def format_result(pos: dict, ex: dict, symbol: str, timeframe: str) -> str:
+    """Announce the realised P/L of a closed position."""
+    r = realised(pos, ex)
+    entry, exit_px, pnl_pct, r_mult = r["entry"], r["exit"], r["pnl_pct"], r["r"]
+    bars = r["bars"]
     days = bars * 4 / 24
 
     win = pnl_pct >= 0
@@ -259,9 +276,29 @@ def _register_position(state: dict, alert: dict) -> None:
     }
 
 
-def check_once(p: Params, notifier: TelegramNotifier, state: dict) -> dict:
+def _update_runtime(runtime: dict, sig, latest_ts) -> None:
+    last = sig.loc[latest_ts]
+    runtime.update({
+        "last_check": datetime.now(timezone.utc).isoformat(),
+        "last_bar": latest_ts.isoformat(),
+        "price": float(last["close"]),
+        "rsi": float(last["rsi"]),
+        "ema_fast": float(last["ema_fast"]),
+        "ema_slow": float(last["ema_slow"]),
+        "atr": float(last["atr"]),
+    })
+
+
+def check_once(p: Params, notifier: TelegramNotifier, state: dict,
+               runtime: dict | None = None, lock: "threading.Lock | None" = None):
+    """One polling cycle. Network fetch happens outside the lock; only the
+    state mutation + runtime snapshot are guarded so command reads stay fast."""
+    if runtime is None:
+        runtime = {}
+    nolock = lock is None
+
     warmup = max(p.ema_slow, p.atr_period, p.rsi_period) + 20
-    df = fetch_recent(SYMBOL, TIMEFRAME, limit=max(400, warmup))
+    df = fetch_recent(SYMBOL, TIMEFRAME, limit=max(400, warmup))  # no lock (slow I/O)
     if len(df) < warmup:
         log.warning("Not enough candles (%d) for warmup (%d).", len(df), warmup)
         return state
@@ -269,54 +306,100 @@ def check_once(p: Params, notifier: TelegramNotifier, state: dict) -> dict:
     sig = generate_signals(df, p)
     latest_ts = sig.index[-1]
 
-    # First run ever: don't replay history, just mark the latest bar.
-    if "last_bar" not in state:
+    if not nolock:
+        lock.acquire()
+    try:
+        _update_runtime(runtime, sig, latest_ts)
+
+        # First run ever: don't replay history, just mark the latest bar.
+        if "last_bar" not in state:
+            state["last_bar"] = latest_ts.isoformat()
+            state.setdefault("history", [])
+            save_state(state)
+            log.info("Initialised at %s (no historical replay).", latest_ts)
+            return state
+
+        last_seen = pd.Timestamp(state["last_bar"])
+        new_bars = sig.index[sig.index > last_seen]
+        if len(new_bars) == 0:
+            return state
+
+        for ts in new_bars:
+            row = sig.loc[ts]
+
+            # 1) Resolve an open tracked position on this bar.
+            pos = state.get("position")
+            if pos:
+                ex = check_exit(pos, row, ts, p)
+                if ex is not None:
+                    notifier.send(format_result(pos, ex, SYMBOL, TIMEFRAME))
+                    trade = realised(pos, ex)
+                    state.setdefault("history", []).append(trade)
+                    state["history"] = state["history"][-500:]  # cap growth
+                    log.info("Closed %s via %s @ %s (entry %s, %.2f%%)",
+                             pos["side"], ex["reason"], ts, pos["entry"], trade["pnl_pct"])
+                    state["position"] = None
+
+            # 2) If flat, look for a new entry to open (and track) a position.
+            #    A trend-flip exit is reported as a position result above, so we
+            #    don't emit standalone "consider exiting" noise when flat.
+            if not state.get("position"):
+                s = signal_from_row(row, ts, p, alert_on_exit=False)
+                if s and s["kind"] == "entry":
+                    notifier.send(format_alert(s, SYMBOL, TIMEFRAME))
+                    _register_position(state, s)
+                    log.info("Entry %s @ %s price %s", s["side"], ts, s["price"])
+
         state["last_bar"] = latest_ts.isoformat()
         save_state(state)
-        log.info("Initialised at %s (no historical replay).", latest_ts)
         return state
+    finally:
+        if not nolock:
+            lock.release()
 
-    last_seen = pd.Timestamp(state["last_bar"])
-    new_bars = sig.index[sig.index > last_seen]
-    if len(new_bars) == 0:
-        return state
 
-    for ts in new_bars:
-        row = sig.loc[ts]
+# --------------------------------------------------------------------------- #
+# Telegram command listener (runs in its own thread)
+# --------------------------------------------------------------------------- #
+def command_loop(notifier: TelegramNotifier, state: dict, runtime: dict,
+                 lock: threading.Lock, p: Params):
+    from src.live import commands
 
-        # 1) Resolve an open tracked position on this bar.
-        closed_this_bar = False
-        pos = state.get("position")
-        if pos:
-            ex = check_exit(pos, row, ts, p)
-            if ex is not None:
-                notifier.send(format_result(pos, ex, SYMBOL, TIMEFRAME))
-                log.info("Closed %s via %s @ %s (entry %s)",
-                         pos["side"], ex["reason"], ts, pos["entry"])
-                state["position"] = None
-                closed_this_bar = True
+    if not notifier.enabled:
+        log.warning("Telegram not configured -> command listener disabled.")
+        return
 
-        # 2) If flat, look for a new entry to open (and track) a position.
-        #    A trend-flip exit is reported when it actually closes a tracked
-        #    position (step 1, reason EXIT), so we don't emit standalone
-        #    "consider exiting" noise when already flat.
-        _ = closed_this_bar  # (kept for clarity; entries can follow a reversal)
-        if not state.get("position"):
-            s = signal_from_row(row, ts, p, alert_on_exit=False)
-            if s and s["kind"] == "entry":
-                notifier.send(format_alert(s, SYMBOL, TIMEFRAME))
-                _register_position(state, s)
-                log.info("Entry %s @ %s price %s", s["side"], ts, s["price"])
+    notifier.set_my_commands(commands.MENU)
+    offset = notifier.drain_updates()  # skip any backlog so we don't replay old cmds
+    log.info("Command listener ready (offset=%s).", offset)
 
-    state["last_bar"] = latest_ts.isoformat()
-    save_state(state)
-    return state
+    while True:
+        try:
+            updates = notifier.get_updates(offset=offset, timeout=25)
+            for u in updates:
+                offset = u["update_id"] + 1
+                msg = u.get("message") or u.get("edited_message") or {}
+                if str(msg.get("chat", {}).get("id")) != str(notifier.chat_id):
+                    continue  # only respond to the configured owner chat
+                text = (msg.get("text") or "").strip()
+                if not text.startswith("/"):
+                    continue
+                with lock:
+                    reply = commands.dispatch(text, state, runtime, p, SYMBOL, TIMEFRAME)
+                if reply:
+                    notifier.send(reply)
+        except Exception as e:  # keep the listener alive through transient errors
+            log.exception("Command loop error: %s", e)
+            time.sleep(5)
 
 
 def main():
     p = load_params()
     notifier = TelegramNotifier()
     state = load_state()
+    state.setdefault("history", [])
+    runtime = {"started_at": datetime.now(timezone.utc).isoformat()}
+    lock = threading.Lock()
 
     log.info("Live monitor starting: %s %s | params=%s | poll=%ss | shorts=%s",
              SYMBOL, TIMEFRAME, p, POLL_SECONDS, p.allow_short)
@@ -324,12 +407,19 @@ def main():
         f"🤖 *ربات رصد بازار فعال شد*\n`{SYMBOL}` {TIMEFRAME} | "
         f"EMA `{p.ema_fast}/{p.ema_slow}` | RSI `{p.rsi_period}` | "
         f"SL `{p.atr_sl_mult}×ATR` / TP `{p.atr_tp_mult}×ATR`\n"
-        f"شروع: `{datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}`"
+        f"شروع: `{datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}`\n"
+        f"برای فهرست دستورها /help را بفرست."
     )
+
+    # Command listener in a daemon thread; market polling in the main thread.
+    t = threading.Thread(
+        target=command_loop, args=(notifier, state, runtime, lock, p), daemon=True
+    )
+    t.start()
 
     while True:
         try:
-            state = check_once(p, notifier, state)
+            check_once(p, notifier, state, runtime, lock)
         except Exception as e:  # never let the loop die on a transient error
             log.exception("Cycle error: %s", e)
         time.sleep(POLL_SECONDS)
