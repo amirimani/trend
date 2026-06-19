@@ -92,6 +92,57 @@ Total return **+633.7%**, CAGR 32.8%, Sharpe 0.76, **max drawdown −81.5%**.
 - Trade counts are low (trend strategies trade rarely), so per-period metrics are
   noisy — treat single-run OOS numbers as indicative, not precise.
 
+## Live monitoring service (Docker → Telegram alerts)
+
+A separate, always-on service polls Binance for closed 4h candles and sends a
+**Telegram alert** the moment an entry (or trend-flip exit) signal appears,
+describing the proposed position: direction, entry, TP, SL and R/R. It is an
+**advisory** service — it never places orders.
+
+> Unlike the backtest sandbox, your Hetzner host has normal internet access, so
+> the live feed uses **genuine Binance BTC/USDT** data via `ccxt`.
+
+### What an alert looks like
+
+```
+🟢 سیگنال خرید (LONG) — BTC/USDT 4h
+⏰ بستن کندل: 2025-01-04 08:00 UTC
+
+📍 ورود (در بازار/کندل بعد): $97,882.0
+🎯 حد سود (TP): $101,936.2  (+4.14%)
+🛑 حد ضرر (SL): $95,854.9  (-2.07%)
+⚖️ نسبت R/R: 2.00
+
+RSI: 61.8 | EMA: 95,928/95,903 | ATR: 1,014
+```
+
+### Deploy on your Hetzner Docker host
+
+```bash
+git clone <this-repo> && cd trend
+cp .env.example .env          # then edit: put your bot token + chat id in .env
+docker compose up -d --build  # builds the image and starts the monitor
+docker compose logs -f        # watch it; you'll get a "bot activated" message
+```
+
+Get a bot token from **@BotFather** and your chat id from **@userinfobot**.
+The service:
+- only makes **outbound** calls (Binance + Telegram) — no open ports needed;
+- `restart: unless-stopped`, so it survives reboots;
+- dedups via a Docker **volume** (`monitor-state`) so a restart won't re-alert
+  the same candle;
+- evaluates signals only on **closed** candles (same no-look-ahead rule as the
+  backtest); poll cadence is `POLL_SECONDS` (default 5 min).
+
+All strategy knobs are env vars in `.env` (`EMA_FAST/EMA_SLOW`, `RSI_*`,
+`ATR_*_MULT`, `ALLOW_SHORT`, `ALERT_ON_EXIT`, …) — **keep them identical to what
+you backtested.**
+
+One-shot manual check (no loop), e.g. for testing on the host:
+```bash
+docker compose run --rm btc-monitor python -m src.live.monitor --once
+```
+
 ## Layout
 
 ```
@@ -101,4 +152,11 @@ src/backtest.py     event-driven engine (next-bar fills, intrabar ATR exits, cos
 src/metrics.py      return / Sharpe / Sortino / drawdown / win-rate / PF
 src/fetch_binance.py  OPTIONAL genuine Binance BTC/USDT loader (ccxt)
 run_backtest.py     orchestration: IS/OOS split, grid search, reporting, plots
+
+src/live/feed.py      live recent-candle feed from Binance (ccxt), drops open bar
+src/live/notifier.py  Telegram Bot-API notifier (dry-run prints if unconfigured)
+src/live/monitor.py   polling loop: closed-bar signal -> formatted Telegram alert
+Dockerfile            image for the live monitoring service
+docker-compose.yml    one-command deploy (volume for dedup state, auto-restart)
+.env.example          configuration template
 ```

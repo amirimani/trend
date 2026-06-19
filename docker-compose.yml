@@ -1,0 +1,20 @@
+services:
+  btc-monitor:
+    build: .
+    image: btc-signal-monitor:latest
+    container_name: btc-signal-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - monitor-state:/data
+    # No inbound ports needed: the service only makes outbound calls to
+    # Binance (market data) and Telegram (alerts).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  monitor-state:

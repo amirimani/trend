@@ -1,0 +1,10 @@
+.git
+.gitignore
+data
+results
+*.md
+__pycache__
+*.pyc
+.env
+scratchpad
+requirements.txt
