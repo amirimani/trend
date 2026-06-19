@@ -29,13 +29,16 @@ DEFAULT_GRID = {
 }
 
 
-def grid_for(timeframe: str) -> dict:
+def grid_for(timeframe: str, allow_short: bool = False) -> dict:
     """Timeframe-aware grid: higher timeframes need FASTER EMA lookbacks (in
-    bars) to generate enough trades to evaluate."""
+    bars) to generate enough trades to evaluate. On futures (allow_short) the
+    search also decides per-coin whether enabling shorts helps out-of-sample."""
     grid = dict(DEFAULT_GRID)
     if timeframe_hours(timeframe) >= 24:        # daily and above
         grid["ema_fast"] = [10, 20]
         grid["ema_slow"] = [50, 100]
+    if allow_short:
+        grid["allow_short"] = [False, True]
     return grid
 
 
@@ -101,25 +104,29 @@ def grid_search(df: pd.DataFrame, costs: Costs, split, grid: dict | None = None,
 
 def analyze_symbol(df: pd.DataFrame, costs: Costs | None = None,
                    split_frac: float = 0.7, grid: dict | None = None,
-                   timeframe: str = "4h") -> dict:
+                   timeframe: str = "4h", base: Params | None = None) -> dict:
     """Auto-tune parameters for one symbol's history (any timeframe).
 
     Splits the data into in-sample (param selection) and out-of-sample
     (validation), grid-searches on IS with timeframe-correct annualisation, and
-    returns the chosen parameters plus IS/OOS performance.
+    returns the chosen parameters plus IS/OOS performance. `base` carries the
+    user settings that are NOT searched (e.g. leverage, and whether shorts are
+    permitted at all on this account).
     """
     costs = costs or Costs()
+    base = base or Params()
     ppy = periods_per_year(timeframe)
-    grid = grid or grid_for(timeframe)
+    grid = grid or grid_for(timeframe, allow_short=base.allow_short)
     # Higher timeframes have fewer bars -> fewer signals; relax the trade floor.
     min_trades = 8 if timeframe_hours(timeframe) >= 24 else 15
     split_i = int(len(df) * split_frac)
     split = df.index[split_i]
 
-    found = grid_search(df, costs, split, grid=grid, ppy=ppy, min_trades=min_trades)
+    found = grid_search(df, costs, split, grid=grid, ppy=ppy,
+                        min_trades=min_trades, base=base)
     if found is None:
-        # Fall back to defaults if nothing cleared the trade threshold.
-        p = Params()
+        # Fall back to the base settings if nothing cleared the trade threshold.
+        p = base
         res = run_backtest(df, p, costs)
         is_m = evaluate(res.equity, res.trades, df.index[0], split, ppy)
         oos_m = evaluate(res.equity, res.trades, split, df.index[-1], ppy)
