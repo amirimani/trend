@@ -81,6 +81,11 @@ TIMEFRAME = os.getenv("TIMEFRAME", "4h")
 POLL_SECONDS = _i("POLL_SECONDS", 300)
 ANALYZE_SINCE = os.getenv("ANALYZE_SINCE", "2020-01-01")
 WATCHLIST_SEED = [s for s in os.getenv("WATCHLIST", "BTC/USDT").split(",") if s.strip()]
+# Quality guard: a symbol whose out-of-sample Sharpe is below this fails
+# validation and is auto-disabled by /analyze. OOS Sharpe in [MIN, WEAK) is
+# kept but flagged as weak.
+MIN_OOS_SHARPE = _f("MIN_OOS_SHARPE", 0.0)
+WEAK_OOS_SHARPE = _f("WEAK_OOS_SHARPE", 0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +244,32 @@ def format_result(pos: dict, ex: dict, symbol: str, timeframe: str) -> str:
     )
 
 
-def format_analysis(summary: dict, symbol: str, timeframe: str) -> str:
+def quality_verdict(oos: dict) -> str:
+    """Rate a tuned strategy by its out-of-sample result: good / weak / fail."""
+    sh = oos.get("sharpe", float("nan"))
+    ret = oos.get("total_return", float("nan"))
+    if sh != sh:  # NaN -> not enough trades to judge
+        return "weak"
+    if sh < MIN_OOS_SHARPE or ret < 0:
+        return "fail"
+    if sh < WEAK_OOS_SHARPE:
+        return "weak"
+    return "good"
+
+
+def verdict_note(verdict: str, symbol: str, enabled: bool) -> str:
+    if verdict == "fail":
+        if not enabled:
+            return (f"🛑 *اعتبارسنجی رد شد* (برون‌نمونه منفی) — `{symbol}` خودکار "
+                    f"*غیرفعال* شد. برای نادیده‌گرفتن: `/enable {symbol}`")
+        return (f"🛑 *برون‌نمونه منفی است* — استراتژی روی `{symbol}` اعتبارسنجی نشد؛ "
+                f"توصیه: `/disable {symbol}`")
+    if verdict == "weak":
+        return "⚠️ نتیجهٔ برون‌نمونه ضعیف است؛ با احتیاط استفاده کن."
+    return "✅ اعتبارسنجی موفق بود — این پارامترها ذخیره و برای رصد استفاده می‌شود."
+
+
+def format_analysis(summary: dict, symbol: str, timeframe: str, footer: str = "") -> str:
     p = summary["params"]
     is_m, oos = summary["in_sample"], summary["out_sample"]
     tuned = "بهینه‌شده" if summary.get("tuned") else "پیش‌فرض (بهینه‌سازی نتیجه نداد)"
@@ -256,7 +286,7 @@ def format_analysis(summary: dict, symbol: str, timeframe: str) -> str:
         f"🧪 *برون‌نمونه (آزمون صادقانه):* بازده `{oos['total_return']*100:+.1f}%` | "
         f"Sharpe `{oos['sharpe']:.2f}` | برد `{oos['win_rate']*100:.0f}%` | "
         f"DD `{oos['max_drawdown']*100:.1f}%` | معاملات `{oos['num_trades']}`\n\n"
-        f"این پارامترها ذخیره شد و از این پس برای رصد `{symbol}` استفاده می‌شود."
+        f"{footer}"
     )
 
 
@@ -341,6 +371,7 @@ def check_all(ctx: Context) -> None:
 def _analysis_worker(ctx: Context, symbol: str) -> None:
     try:
         summary = run_analysis(symbol, ctx.fetch_history_fn, ctx.timeframe, ANALYZE_SINCE)
+        verdict = quality_verdict(summary["out_sample"])
         with ctx.lock:
             wl = st.watchlist(ctx.state)
             if symbol not in wl:
@@ -349,11 +380,17 @@ def _analysis_worker(ctx: Context, symbol: str) -> None:
             wl[symbol]["analyzed_at"] = datetime.now(timezone.utc).isoformat()
             wl[symbol]["analysis"] = {
                 "tuned": summary["tuned"], "range": summary["range"],
+                "n_bars": summary["n_bars"], "verdict": verdict,
                 "in_sample": summary["in_sample"], "out_sample": summary["out_sample"],
             }
+            if verdict == "fail":  # quality guard: auto-disable poor performers
+                wl[symbol]["enabled"] = False
+            enabled = wl[symbol]["enabled"]
             st.save_state(ctx.state)
-        ctx.notifier.send(format_analysis(summary, symbol, ctx.timeframe))
-        log.info("Analysis done for %s (tuned=%s).", symbol, summary["tuned"])
+        footer = verdict_note(verdict, symbol, enabled)
+        ctx.notifier.send(format_analysis(summary, symbol, ctx.timeframe, footer))
+        log.info("Analysis done for %s (tuned=%s, verdict=%s).",
+                 symbol, summary["tuned"], verdict)
     except Exception as e:
         log.exception("Analysis failed for %s: %s", symbol, e)
         ctx.notifier.send(f"❌ تحلیل `{symbol}` ناموفق بود: {e}")

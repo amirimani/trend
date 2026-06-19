@@ -23,6 +23,7 @@ MENU = [
     ("price", "قیمت و اندیکاتورها: /price SOL"),
     ("params", "پارامترهای یک ارز: /params SOL"),
     ("analyze", "بهینه‌سازی پارامترهای یک ارز: /analyze SOL"),
+    ("report", "نمایش دوبارهٔ نتیجهٔ تحلیل ذخیره‌شده: /report SOL"),
     ("add", "افزودن ارز: /add SOL/USDT"),
     ("remove", "حذف ارز: /remove SOL"),
     ("enable", "فعال‌سازی ارز: /enable SOL"),
@@ -293,6 +294,30 @@ def cmd_analyze(ctx, arg=None):
     return ctx.start_analysis(arg)
 
 
+def cmd_report(ctx, arg=None):
+    """Re-show the stored analysis (IS/OOS + verdict) for a symbol."""
+    from src.live import monitor  # lazy to avoid import cycle
+
+    sym = _resolve_symbol(ctx, arg)
+    if sym is None:
+        return "نماد را مشخص کن: مثلا `/report SOL`"
+    e = st.watchlist(ctx.state).get(sym)
+    if not e:
+        return f"`{sym}` در واچ‌لیست نیست."
+    a = e.get("analysis")
+    if not a:
+        return f"📭 `{sym}` هنوز تحلیل نشده. اول `/analyze {sym}` را بزن."
+    summary = {
+        "params": e["params"], "tuned": a.get("tuned", False),
+        "range": a.get("range", ["?", "?"]), "n_bars": a.get("n_bars", 0),
+        "in_sample": a["in_sample"], "out_sample": a["out_sample"],
+    }
+    verdict = a.get("verdict") or monitor.quality_verdict(a["out_sample"])
+    footer = monitor.verdict_note(verdict, sym, e.get("enabled", True))
+    when = f"\n_آخرین تحلیل: {_dt(e.get('analyzed_at'))}_"
+    return monitor.format_analysis(summary, sym, ctx.timeframe, footer) + when
+
+
 # --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
@@ -302,6 +327,7 @@ _HANDLERS = {
     "stats": cmd_stats, "price": cmd_price, "params": cmd_params, "config": cmd_params,
     "add": cmd_add, "remove": cmd_remove, "delete": cmd_remove,
     "enable": cmd_enable, "disable": cmd_disable, "analyze": cmd_analyze,
+    "report": cmd_report,
 }
 
 
