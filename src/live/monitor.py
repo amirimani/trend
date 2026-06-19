@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timezone
 
 import numpy as np
+import pandas as pd
 
 from src.strategy import Params, generate_signals
 from src.live.feed import fetch_recent
@@ -71,7 +72,6 @@ def load_params() -> Params:
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 TIMEFRAME = os.getenv("TIMEFRAME", "4h")
 POLL_SECONDS = _i("POLL_SECONDS", 300)
-ALERT_ON_EXIT = _b("ALERT_ON_EXIT", True)
 STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
 
 
@@ -97,14 +97,11 @@ def save_state(state: dict) -> None:
 # --------------------------------------------------------------------------- #
 # Signal evaluation on the most recently closed bar
 # --------------------------------------------------------------------------- #
-def evaluate_last_bar(df, p: Params, alert_on_exit: bool = True) -> dict | None:
-    """Return an alert dict for the last closed bar, or None if no signal."""
-    sig = generate_signals(df, p)
-    last = sig.iloc[-1]
-    ts = sig.index[-1]
-    price = float(last["close"])
-    atr = float(last["atr"])
-    rsi = float(last["rsi"])
+def signal_from_row(row, ts, p: Params, alert_on_exit: bool = True) -> dict | None:
+    """Return an alert dict for a single (closed) signal row, or None."""
+    price = float(row["close"])
+    atr = float(row["atr"])
+    rsi = float(row["rsi"])
 
     if not np.isfinite(atr) or atr <= 0:
         return None
@@ -114,27 +111,66 @@ def evaluate_last_bar(df, p: Params, alert_on_exit: bool = True) -> dict | None:
         "price": price,
         "atr": atr,
         "rsi": rsi,
-        "ema_fast": float(last["ema_fast"]),
-        "ema_slow": float(last["ema_slow"]),
+        "ema_fast": float(row["ema_fast"]),
+        "ema_slow": float(row["ema_slow"]),
     }
 
-    if bool(last["long_entry"]):
+    if bool(row["long_entry"]):
         sl = price - p.atr_sl_mult * atr
         tp = price + p.atr_tp_mult * atr
         rr = (tp - price) / (price - sl) if price > sl else float("nan")
         return {**base, "kind": "entry", "side": "LONG", "sl": sl, "tp": tp, "rr": rr}
 
-    if p.allow_short and bool(last["short_entry"]):
+    if p.allow_short and bool(row["short_entry"]):
         sl = price + p.atr_sl_mult * atr
         tp = price - p.atr_tp_mult * atr
         rr = (price - tp) / (sl - price) if sl > price else float("nan")
         return {**base, "kind": "entry", "side": "SHORT", "sl": sl, "tp": tp, "rr": rr}
 
-    if alert_on_exit and bool(last["long_exit"]):
+    if alert_on_exit and bool(row["long_exit"]):
         return {**base, "kind": "exit", "side": "LONG"}
-    if alert_on_exit and p.allow_short and bool(last["short_exit"]):
+    if alert_on_exit and p.allow_short and bool(row["short_exit"]):
         return {**base, "kind": "exit", "side": "SHORT"}
 
+    return None
+
+
+def evaluate_last_bar(df, p: Params, alert_on_exit: bool = True) -> dict | None:
+    """Return an alert dict for the last closed bar, or None if no signal."""
+    sig = generate_signals(df, p)
+    return signal_from_row(sig.iloc[-1], sig.index[-1], p, alert_on_exit)
+
+
+def check_exit(pos: dict, row, ts, p: Params) -> dict | None:
+    """
+    Has the tracked position `pos` been resolved on this closed bar?
+
+    Mirrors the backtest exit rules: stop checked before target (pessimistic),
+    gap-through fills at the bar open, and a trend-flip (opposite EMA cross)
+    closes at the bar close. Returns an exit dict or None.
+    """
+    o, h, l, c = (float(row["open"]), float(row["high"]),
+                  float(row["low"]), float(row["close"]))
+    sl, tp = pos["sl"], pos["tp"]
+
+    if pos["side"] == "LONG":
+        if l <= sl:
+            px = o if o <= sl else sl       # gap-down through the stop
+            return {"exit_price": px, "reason": "SL", "time": ts}
+        if h >= tp:
+            px = o if o >= tp else tp        # gap-up through the target
+            return {"exit_price": px, "reason": "TP", "time": ts}
+        if bool(row["long_exit"]):
+            return {"exit_price": c, "reason": "EXIT", "time": ts}
+    else:  # SHORT
+        if h >= sl:
+            px = o if o >= sl else sl
+            return {"exit_price": px, "reason": "SL", "time": ts}
+        if l <= tp:
+            px = o if o <= tp else tp
+            return {"exit_price": px, "reason": "TP", "time": ts}
+        if bool(row["short_exit"]):
+            return {"exit_price": c, "reason": "EXIT", "time": ts}
     return None
 
 
@@ -172,9 +208,57 @@ def format_alert(a: dict, symbol: str, timeframe: str) -> str:
     )
 
 
+_REASON_FA = {
+    "TP": "اصابت به حد سود (TP) 🎯",
+    "SL": "اصابت به حد ضرر (SL) 🛑",
+    "EXIT": "فلیپ روند / کراس معکوس EMA ⚪️",
+}
+
+
+def format_result(pos: dict, ex: dict, symbol: str, timeframe: str) -> str:
+    """Announce the realised P/L of a closed position."""
+    entry = pos["entry"]
+    exit_px = ex["exit_price"]
+    is_long = pos["side"] == "LONG"
+
+    pnl_pct = (exit_px / entry - 1.0) * 100.0 if is_long else (entry / exit_px - 1.0) * 100.0
+    risk = abs(entry - pos["sl"])
+    reward = (exit_px - entry) if is_long else (entry - exit_px)
+    r_mult = reward / risk if risk > 0 else float("nan")
+
+    entry_ts = pd.Timestamp(pos["entry_time"])
+    bars = max(1, round((ex["time"] - entry_ts).total_seconds() / (4 * 3600)))
+    days = bars * 4 / 24
+
+    win = pnl_pct >= 0
+    head_emoji = "✅" if win else "❌"
+    verb = "سود" if win else "ضرر"
+    return (
+        f"{head_emoji} *نتیجهٔ پوزیشن {pos['side']} بسته شد* — `{symbol}` {timeframe}\n"
+        f"دلیل خروج: {_REASON_FA.get(ex['reason'], ex['reason'])}\n\n"
+        f"📍 ورود: `${entry:,.1f}`\n"
+        f"🚪 خروج: `${exit_px:,.1f}`\n"
+        f"💰 {verb}: `{pnl_pct:+.2f}%`  (R: `{r_mult:+.2f}`)\n"
+        f"🕒 مدت نگهداری: `{bars}` کندل (~`{days:.1f}` روز)\n"
+        f"⏰ زمان خروج: `{ex['time'].strftime('%Y-%m-%d %H:%M UTC')}`\n"
+        f"_سود/زیان بر مبنای قیمت و بدون احتساب کارمزد است._"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # One polling cycle
 # --------------------------------------------------------------------------- #
+def _register_position(state: dict, alert: dict) -> None:
+    state["position"] = {
+        "side": alert["side"],
+        "entry": alert["price"],
+        "sl": alert["sl"],
+        "tp": alert["tp"],
+        "rr": alert["rr"],
+        "entry_time": alert["time"].isoformat(),
+    }
+
+
 def check_once(p: Params, notifier: TelegramNotifier, state: dict) -> dict:
     warmup = max(p.ema_slow, p.atr_period, p.rsi_period) + 20
     df = fetch_recent(SYMBOL, TIMEFRAME, limit=max(400, warmup))
@@ -182,19 +266,49 @@ def check_once(p: Params, notifier: TelegramNotifier, state: dict) -> dict:
         log.warning("Not enough candles (%d) for warmup (%d).", len(df), warmup)
         return state
 
-    last_ts = df.index[-1].isoformat()
-    if state.get("last_bar") == last_ts:
-        return state  # already processed this closed bar
+    sig = generate_signals(df, p)
+    latest_ts = sig.index[-1]
 
-    alert = evaluate_last_bar(df, p, ALERT_ON_EXIT)
-    if alert is not None:
-        msg = format_alert(alert, SYMBOL, TIMEFRAME)
-        notifier.send(msg)
-        log.info("Signal: %s %s @ %s", alert["kind"], alert["side"], last_ts)
-    else:
-        log.info("New closed bar %s — no signal.", last_ts)
+    # First run ever: don't replay history, just mark the latest bar.
+    if "last_bar" not in state:
+        state["last_bar"] = latest_ts.isoformat()
+        save_state(state)
+        log.info("Initialised at %s (no historical replay).", latest_ts)
+        return state
 
-    state["last_bar"] = last_ts
+    last_seen = pd.Timestamp(state["last_bar"])
+    new_bars = sig.index[sig.index > last_seen]
+    if len(new_bars) == 0:
+        return state
+
+    for ts in new_bars:
+        row = sig.loc[ts]
+
+        # 1) Resolve an open tracked position on this bar.
+        closed_this_bar = False
+        pos = state.get("position")
+        if pos:
+            ex = check_exit(pos, row, ts, p)
+            if ex is not None:
+                notifier.send(format_result(pos, ex, SYMBOL, TIMEFRAME))
+                log.info("Closed %s via %s @ %s (entry %s)",
+                         pos["side"], ex["reason"], ts, pos["entry"])
+                state["position"] = None
+                closed_this_bar = True
+
+        # 2) If flat, look for a new entry to open (and track) a position.
+        #    A trend-flip exit is reported when it actually closes a tracked
+        #    position (step 1, reason EXIT), so we don't emit standalone
+        #    "consider exiting" noise when already flat.
+        _ = closed_this_bar  # (kept for clarity; entries can follow a reversal)
+        if not state.get("position"):
+            s = signal_from_row(row, ts, p, alert_on_exit=False)
+            if s and s["kind"] == "entry":
+                notifier.send(format_alert(s, SYMBOL, TIMEFRAME))
+                _register_position(state, s)
+                log.info("Entry %s @ %s price %s", s["side"], ts, s["price"])
+
+    state["last_bar"] = latest_ts.isoformat()
     save_state(state)
     return state
 

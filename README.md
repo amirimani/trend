@@ -95,8 +95,10 @@ Total return **+633.7%**, CAGR 32.8%, Sharpe 0.76, **max drawdown −81.5%**.
 ## Live monitoring service (Docker → Telegram alerts)
 
 A separate, always-on service polls Binance for closed 4h candles and sends a
-**Telegram alert** the moment an entry (or trend-flip exit) signal appears,
-describing the proposed position: direction, entry, TP, SL and R/R. It is an
+**Telegram alert** the moment an entry signal appears, describing the proposed
+position: direction, entry, TP, SL and R/R. It then **tracks that position** and
+sends a follow-up **result message** once the trade plays out (TP hit, SL hit, or
+a trend-flip exit), reporting the realised profit/loss and R multiple. It is an
 **advisory** service — it never places orders.
 
 > Unlike the backtest sandbox, your Hetzner host has normal internet access, so
@@ -115,6 +117,22 @@ describing the proposed position: direction, entry, TP, SL and R/R. It is an
 
 RSI: 61.8 | EMA: 95,928/95,903 | ATR: 1,014
 ```
+
+And when that position later resolves:
+
+```
+✅ نتیجهٔ پوزیشن LONG بسته شد — BTC/USDT 4h
+دلیل خروج: اصابت به حد سود (TP) 🎯
+
+📍 ورود: $10,401.0
+🚪 خروج: $11,586.0
+💰 سود: +11.39%  (R: +2.00)
+🕒 مدت نگهداری: 24 کندل (~4.0 روز)
+```
+
+The open position is persisted in the dedup volume, so the follow-up result is
+sent even if the container restarts between entry and exit. Exit resolution uses
+the same intrabar rules as the backtest (stop-before-target, gap-through at open).
 
 ### Deploy on your Hetzner Docker host
 
@@ -135,8 +153,7 @@ The service:
   backtest); poll cadence is `POLL_SECONDS` (default 5 min).
 
 All strategy knobs are env vars in `.env` (`EMA_FAST/EMA_SLOW`, `RSI_*`,
-`ATR_*_MULT`, `ALLOW_SHORT`, `ALERT_ON_EXIT`, …) — **keep them identical to what
-you backtested.**
+`ATR_*_MULT`, `ALLOW_SHORT`, …) — **keep them identical to what you backtested.**
 
 One-shot manual check (no loop), e.g. for testing on the host:
 ```bash
@@ -155,7 +172,7 @@ run_backtest.py     orchestration: IS/OOS split, grid search, reporting, plots
 
 src/live/feed.py      live recent-candle feed from Binance (ccxt), drops open bar
 src/live/notifier.py  Telegram Bot-API notifier (dry-run prints if unconfigured)
-src/live/monitor.py   polling loop: closed-bar signal -> formatted Telegram alert
+src/live/monitor.py   polling loop: entry alert -> position tracking -> P/L result
 Dockerfile            image for the live monitoring service
 docker-compose.yml    one-command deploy (volume for dedup state, auto-restart)
 .env.example          configuration template
