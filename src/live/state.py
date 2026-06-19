@@ -91,26 +91,31 @@ def save_state(state: dict, path: str = STATE_FILE) -> None:
 
 def migrate(state: dict, default_symbol: str, default_params: Params,
             seed_symbols: list[str] | None = None) -> dict:
-    """Bring any older/empty state up to v2 and seed the initial watchlist."""
-    if state.get("version") == 2 and "watchlist" in state:
-        wl = state["watchlist"]
-    else:
-        wl = {}
-        # v1 had flat last_bar/position/history for a single (default) symbol.
-        if any(k in state for k in ("last_bar", "position", "history")):
-            entry = new_entry(default_params, enabled=True)
-            entry["last_bar"] = state.get("last_bar")
-            entry["position"] = state.get("position")
-            entry["history"] = state.get("history", [])
-            wl[default_symbol] = entry
-        state = {"version": 2, "watchlist": wl}
+    """Bring older/empty state up to v2 and seed the initial watchlist.
 
-    # Seed any requested symbols that aren't present yet.
+    IMPORTANT: seeding from WATCHLIST happens ONLY on first run (empty/old
+    state). Once a v2 watchlist exists it is authoritative and is returned
+    untouched — otherwise coins removed via /remove would reappear on every
+    reboot, and the watchlist would appear to "reset to default".
+    """
+    if state.get("version") == 2 and "watchlist" in state:
+        return state  # already initialised; persisted watchlist wins
+
+    wl = {}
+    # v1 had flat last_bar/position/history for a single (default) symbol.
+    if any(k in state for k in ("last_bar", "position", "history")):
+        entry = new_entry(default_params, enabled=True)
+        entry["last_bar"] = state.get("last_bar")
+        entry["position"] = state.get("position")
+        entry["history"] = state.get("history", [])
+        wl[default_symbol] = entry
+
+    # First-run seed from the WATCHLIST env.
     for sym in (seed_symbols or []):
         sym = normalize_symbol(sym)
         if sym and sym not in wl:
             wl[sym] = new_entry(default_params, enabled=True)
-    return state
+    return {"version": 2, "watchlist": wl}
 
 
 # --------------------------------------------------------------------------- #
