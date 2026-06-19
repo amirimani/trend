@@ -6,12 +6,22 @@ in-sample / out-of-sample split.
 
 ## Strategy
 
-- **Direction:** EMA fast/slow cross (default 50 / 200) — long-only by default
-  (spot BTC). Shorts are available via `Params(allow_short=True)`.
-- **Entry filter:** RSI(14) must be inside a band (default `50 ≤ RSI < 70`) so we
-  do not buy into an already-overbought market.
-- **Risk management:** ATR(14)-based stop-loss and take-profit, fixed at entry
-  (default `SL = 2·ATR`, `TP = 4·ATR`). Exit also on the opposite EMA cross.
+- **Entry:** EMA fast/slow cross (default 50 / 200) **or** Donchian breakout
+  (`entry_mode`). Long-only by default; shorts via `allow_short=True`.
+- **Entry filter (optional):** RSI(14) band (`use_rsi_filter`, default
+  `50 ≤ RSI < 70`) to avoid buying into an overbought market, plus an optional
+  **trend-regime filter** (`regime_filter`: only long above a long EMA).
+- **Exit (`exit_mode`):**
+  - `fixed` — ATR stop-loss + fixed ATR take-profit (default `SL 2·ATR`, `TP 4·ATR`).
+  - `trailing` — ATR stop, no fixed target; a chandelier trailing stop lets
+    winners run until the trend reverses (best for big trends).
+  - `partial` — take part of the position at the first target, move the stop to
+    break-even, then trail the remainder.
+  - All modes also exit on the opposite signal (trend flip).
+
+The offline backtest and the live engine share **one** exit implementation
+(`src/position.py`), so live alerts behave exactly as backtested. `/analyze`
+grid-searches the entry filter, exit mode and regime filter per coin.
 
 ## Data
 
