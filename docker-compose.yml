@@ -1,8 +1,8 @@
 services:
-  btc-monitor:
+  monitor:
     build: .
-    image: btc-signal-monitor:latest
-    container_name: btc-signal-monitor
+    image: crypto-signal-monitor:latest
+    container_name: crypto-signal-monitor
     restart: unless-stopped
     env_file:
       - .env
