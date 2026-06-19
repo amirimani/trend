@@ -659,9 +659,18 @@ def _send_reply(ctx: Context, reply) -> None:
 def build_context() -> Context:
     notifier = TelegramNotifier()
     default_p = load_params()
-    state = st.migrate(st.load_state(), st.normalize_symbol(WATCHLIST_SEED[0]),
+    raw = st.load_state()
+    existed = raw.get("version") == 2 and "watchlist" in raw
+    state = st.migrate(raw, st.normalize_symbol(WATCHLIST_SEED[0]),
                        default_p, seed_symbols=WATCHLIST_SEED)
-    st.save_state(state)
+    try:
+        st.save_state(state)
+    except OSError as e:
+        log.error("CANNOT WRITE STATE at %s (%s) — watchlist will NOT persist! "
+                  "Check the Docker volume mount/permissions.", st.STATE_FILE, e)
+    log.info("State %s at %s | watchlist: %s",
+             "LOADED (persisted)" if existed else "INITIALISED (fresh seed)",
+             st.STATE_FILE, list(st.watchlist(state)))
     return Context(notifier=notifier, state=state, default_params=default_p)
 
 
