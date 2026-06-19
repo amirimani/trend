@@ -16,6 +16,7 @@ from src.live import state as st
 
 MENU = [
     ("list", "فهرست ارزها و وضعیت‌شان"),
+    ("summary", "گزارش هفتگی عملکرد همهٔ ارزها"),
     ("status", "وضعیت کلی یا یک ارز: /status SOL"),
     ("position", "پوزیشن باز یک ارز: /position SOL"),
     ("stats", "آمار معاملات یک ارز: /stats SOL"),
@@ -294,6 +295,16 @@ def cmd_analyze(ctx, arg=None):
     return ctx.start_analysis(arg)
 
 
+def cmd_summary(ctx, arg=None):
+    """On-demand weekly performance report (default 7 days; /summary 30 for 30d)."""
+    from src.live import monitor  # lazy to avoid import cycle
+    try:
+        days = max(1, min(365, int(arg)))
+    except (ValueError, TypeError):
+        days = 7
+    return monitor.build_weekly_report(ctx, days=days)
+
+
 def cmd_report(ctx, arg=None):
     """Re-show the stored analysis (IS/OOS + verdict) for a symbol."""
     from src.live import monitor  # lazy to avoid import cycle
@@ -322,7 +333,7 @@ def cmd_report(ctx, arg=None):
 # dispatch
 # --------------------------------------------------------------------------- #
 _HANDLERS = {
-    "help": cmd_help, "start": cmd_help, "list": cmd_list,
+    "help": cmd_help, "start": cmd_help, "list": cmd_list, "summary": cmd_summary,
     "status": cmd_status, "position": cmd_position, "pos": cmd_position,
     "stats": cmd_stats, "price": cmd_price, "params": cmd_params, "config": cmd_params,
     "add": cmd_add, "remove": cmd_remove, "delete": cmd_remove,

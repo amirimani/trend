@@ -29,7 +29,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -86,6 +86,11 @@ WATCHLIST_SEED = [s for s in os.getenv("WATCHLIST", "BTC/USDT").split(",") if s.
 # kept but flagged as weak.
 MIN_OOS_SHARPE = _f("MIN_OOS_SHARPE", 0.0)
 WEAK_OOS_SHARPE = _f("WEAK_OOS_SHARPE", 0.5)
+# Weekly performance report: sent once per ISO week, on/after REPORT_DAY
+# (0=Mon) at REPORT_HOUR UTC. Also available on demand via /summary.
+WEEKLY_REPORT = _b("WEEKLY_REPORT", True)
+REPORT_DAY = _i("REPORT_DAY", 0)
+REPORT_HOUR = _i("REPORT_HOUR", 9)
 
 
 # --------------------------------------------------------------------------- #
@@ -399,6 +404,89 @@ def _analysis_worker(ctx: Context, symbol: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Weekly performance report
+# --------------------------------------------------------------------------- #
+def _period_stats(hist: list) -> tuple:
+    n = len(hist)
+    wins = sum(1 for t in hist if t["pnl_pct"] >= 0)
+    rs = [t["r"] for t in hist if t.get("r") == t.get("r")]
+    pnl = sum(t["pnl_pct"] for t in hist)
+    return n, wins, sum(rs), pnl
+
+
+def build_weekly_report(ctx: "Context", days: int = 7) -> str:
+    """Summarise closed trades and open positions across the watchlist.
+
+    Reads shared state/runtime; callers hold ctx.lock (it does not lock itself).
+    """
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
+    wl = st.watchlist(ctx.state)
+
+    lines, tot_n, tot_w, tot_r, tot_pnl, open_count = [], 0, 0, 0.0, 0.0, 0
+    best = worst = None
+    for sym, e in wl.items():
+        hist = [t for t in e.get("history", []) if pd.Timestamp(t["exit_time"]) >= since]
+        pos = e.get("position")
+        if pos:
+            open_count += 1
+        if not hist and not pos:
+            continue
+        n, w, r, pnl = _period_stats(hist)
+        tot_n += n; tot_w += w; tot_r += r; tot_pnl += pnl
+        flag = "🟢" if e.get("enabled") else "⚪️"
+        seg = f"{flag} `{sym}`"
+        seg += (f": {n} معامله | برد {w/n*100:.0f}% | R `{r:+.1f}` | `{pnl:+.1f}%`"
+                if n else ": بدون معاملهٔ بسته")
+        if pos:
+            rt = ctx.runtime.get("symbols", {}).get(sym, {})
+            price = rt.get("price")
+            if price:
+                up = (price / pos["entry"] - 1) * 100 if pos["side"] == "LONG" \
+                    else (pos["entry"] / price - 1) * 100
+                seg += f"  📌{pos['side']} شناور `{up:+.1f}%`"
+            else:
+                seg += "  📌پوزیشن باز"
+        lines.append(seg)
+        if n:
+            best = (sym, pnl) if best is None or pnl > best[1] else best
+            worst = (sym, pnl) if worst is None or pnl < worst[1] else worst
+
+    enabled = sum(1 for e in wl.values() if e.get("enabled"))
+    head = f"📅 *گزارش هفتگی* ({since:%Y-%m-%d} → {now:%Y-%m-%d} UTC)"
+    if not lines:
+        return head + "\n\nاین بازه معامله‌ای بسته نشد و پوزیشن بازی هم نیست."
+    foot = (f"\n\n📊 *مجموع:* {tot_n} معامله"
+            + (f" | برد {tot_w/tot_n*100:.0f}%" if tot_n else "")
+            + f" | R `{tot_r:+.1f}` | `{tot_pnl:+.1f}%`\n"
+            f"🟢 فعال: {enabled} از {len(wl)} | 📌 پوزیشن باز: {open_count}")
+    if best:
+        foot += f"\n🏆 بهترین: `{best[0]}` (`{best[1]:+.1f}%`)"
+    if worst and worst[0] != best[0]:
+        foot += f"  |  🔻 بدترین: `{worst[0]}` (`{worst[1]:+.1f}%`)"
+    return head + "\n\n" + "\n".join(lines) + foot
+
+
+def maybe_send_weekly(ctx: "Context") -> None:
+    """Send the weekly report once per ISO week, on/after the scheduled time."""
+    if not WEEKLY_REPORT or not ctx.notifier.enabled:
+        return
+    now = datetime.now(timezone.utc)
+    iso = now.isocalendar()
+    key = f"{iso[0]}-W{iso[1]:02d}"
+    with ctx.lock:
+        if ctx.state.get("last_report_week") == key:
+            return
+        if now.weekday() < REPORT_DAY or (now.weekday() == REPORT_DAY and now.hour < REPORT_HOUR):
+            return
+        text = build_weekly_report(ctx)
+        ctx.state["last_report_week"] = key
+        st.save_state(ctx.state)
+    ctx.notifier.send(text)
+    log.info("Weekly report sent (%s).", key)
+
+
+# --------------------------------------------------------------------------- #
 # Telegram command listener
 # --------------------------------------------------------------------------- #
 def command_loop(ctx: Context) -> None:
@@ -420,7 +508,8 @@ def command_loop(ctx: Context) -> None:
                 text = (msg.get("text") or "").strip()
                 if not text.startswith("/"):
                     continue
-                reply = commands.dispatch(text, ctx)
+                with ctx.lock:  # serialise command handling vs the market/analysis threads
+                    reply = commands.dispatch(text, ctx)
                 if reply:
                     ctx.notifier.send(reply)
         except Exception as e:
@@ -454,6 +543,7 @@ def main():
     while True:
         try:
             check_all(ctx)
+            maybe_send_weekly(ctx)
         except Exception as e:
             log.exception("Cycle error: %s", e)
         time.sleep(POLL_SECONDS)
