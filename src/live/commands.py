@@ -28,6 +28,7 @@ MENU = [
     ("analyze", "بهینه‌سازی پارامترهای یک ارز: /analyze SOL"),
     ("analyze_all", "تحلیل مجدد همهٔ ارزهای فعال"),
     ("backtest", "بک‌تست و نمودار یک ارز: /backtest SOL"),
+    ("backtest_all", "تحلیل نموداری همهٔ ارزها"),
     ("report", "نمایش دوبارهٔ نتیجهٔ تحلیل ذخیره‌شده: /report SOL"),
     ("add", "افزودن ارز: /add SOL/USDT"),
     ("remove", "حذف ارز: /remove SOL"),
@@ -49,6 +50,7 @@ def main_menu_kb(ctx) -> dict:
     rows = [[_btn("📋 لیست", "list"), _btn("📅 گزارش هفتگی", "summary")]]
     rows.append([_btn("⚖️ مقایسهٔ ارزها", "compare"),
                  _btn("🔬 تحلیل مجدد همه", "analyze_all")])
+    rows.append([_btn("📈 تحلیل نموداری همه", "backtest_all")])
     row = []
     for s in wl:
         flag = "🟢" if wl[s].get("enabled") else "⚪️"
@@ -366,6 +368,10 @@ def cmd_analyze_all(ctx, arg=None):
     return ctx.start_analysis_all()
 
 
+def cmd_backtest_all(ctx, arg=None):
+    return ctx.start_backtest_all()
+
+
 def cmd_compare(ctx, arg=None):
     """Rank watched coins by their out-of-sample Sharpe to ease selection."""
     wl = st.watchlist(ctx.state)
@@ -455,7 +461,8 @@ _HANDLERS = {
     "add": cmd_add, "remove": cmd_remove, "delete": cmd_remove,
     "enable": cmd_enable, "disable": cmd_disable, "analyze": cmd_analyze,
     "analyze_all": cmd_analyze_all, "analyzeall": cmd_analyze_all,
-    "backtest": cmd_backtest, "report": cmd_report,
+    "backtest": cmd_backtest, "backtest_all": cmd_backtest_all,
+    "backtestall": cmd_backtest_all, "report": cmd_report,
 }
 
 
