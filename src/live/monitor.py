@@ -124,16 +124,20 @@ class Context:
         return f"🔬 تحلیل `{symbol}` شروع شد؛ نتیجه را به‌زودی می‌فرستم…"
 
     def start_analysis_all(self) -> str:
-        """Queue auto-tuning for every enabled coin (staggered, one worker each)."""
-        syms = [s for s, e in st.watchlist(self.state).items() if e.get("enabled")]
-        started = [s for s in syms if s not in self.analyzing]
-        for s in started:
-            self.analyzing.add(s)
-            threading.Thread(target=_analysis_worker, args=(self, s, False), daemon=True).start()
-        if not started:
+        """Re-tune every enabled coin, SEQUENTIALLY (gentle on the exchange)."""
+        syms = [s for s, e in st.watchlist(self.state).items()
+                if e.get("enabled") and s not in self.analyzing]
+        if not syms:
             return "هیچ ارز فعالی برای تحلیل نیست (یا همه در حال تحلیل‌اند)."
+        for s in syms:
+            self.analyzing.add(s)
+
+        def run():
+            for s in syms:
+                _analysis_worker(self, s, auto=False)   # discards itself in finally
+        threading.Thread(target=run, daemon=True).start()
         return ("🔬 تحلیل مجدد همهٔ ارزهای فعال شروع شد:\n"
-                + "، ".join(f"`{s}`" for s in started)
+                + "، ".join(f"`{s}`" for s in syms)
                 + "\nنتایج به‌ترتیب آماده‌شدن ارسال می‌شوند…")
 
     def start_backtest(self, symbol: str) -> str:
@@ -147,16 +151,20 @@ class Context:
         return f"🧪 بک‌تست `{symbol}` شروع شد؛ نتیجه و نمودار به‌زودی می‌آید…"
 
     def start_backtest_all(self) -> str:
-        """Run a chart backtest for every coin in the watchlist (one worker each)."""
-        syms = list(st.watchlist(self.state))
-        started = [s for s in syms if s not in self.backtesting]
-        for s in started:
-            self.backtesting.add(s)
-            threading.Thread(target=_backtest_worker, args=(self, s), daemon=True).start()
-        if not started:
+        """Chart-backtest every coin, SEQUENTIALLY (matplotlib isn't thread-safe
+        and concurrent exchange fetches hit rate limits)."""
+        syms = [s for s in st.watchlist(self.state) if s not in self.backtesting]
+        if not syms:
             return "ارزی برای بک‌تست نیست (یا همه در حال اجرا)."
+        for s in syms:
+            self.backtesting.add(s)
+
+        def run():
+            for s in syms:
+                _backtest_worker(self, s)   # discards itself in finally
+        threading.Thread(target=run, daemon=True).start()
         return ("📈 بک‌تست نموداری همهٔ ارزها شروع شد:\n"
-                + "، ".join(f"`{s}`" for s in started)
+                + "، ".join(f"`{s}`" for s in syms)
                 + "\nنمودارها به‌ترتیب آماده‌شدن ارسال می‌شوند…")
 
 
@@ -502,29 +510,34 @@ def maybe_reanalyze(ctx: Context) -> None:
 # --------------------------------------------------------------------------- #
 # On-demand backtest (/backtest) — runs current params over full history
 # --------------------------------------------------------------------------- #
+_PLOT_LOCK = threading.Lock()  # matplotlib is NOT thread-safe — serialise plotting
+
+
 def _plot_equity(symbol: str, res, timeframe: str) -> str | None:
     try:
         import matplotlib
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        from matplotlib.figure import Figure   # OO API: avoids pyplot global state
     except Exception:
         return None
     import tempfile
 
     eq, bnh = res.equity, res.bnh_equity
-    fig, ax = plt.subplots(2, 1, figsize=(11, 7), gridspec_kw={"height_ratios": [3, 1]})
-    ax[0].plot(eq.index, eq.values, label="Strategy", lw=1.3)
-    if bnh is not None:
-        ax[0].plot(bnh.index, bnh.values, label="Buy & Hold", lw=1.0, alpha=0.7)
-    ax[0].set_yscale("log")
-    ax[0].set_title(f"{symbol} {timeframe} — backtest equity (log)")
-    ax[0].legend(); ax[0].grid(alpha=0.3)
-    dd = eq / eq.cummax() - 1.0
-    ax[1].fill_between(dd.index, dd.values * 100, 0, color="red", alpha=0.4)
-    ax[1].set_title("Drawdown (%)"); ax[1].grid(alpha=0.3)
-    fig.tight_layout()
     path = os.path.join(tempfile.gettempdir(), f"bt_{symbol.replace('/', '')}.png")
-    fig.savefig(path, dpi=110); plt.close(fig)
+    with _PLOT_LOCK:
+        fig = Figure(figsize=(11, 7))
+        ax = fig.subplots(2, 1, gridspec_kw={"height_ratios": [3, 1]})
+        ax[0].plot(eq.index, eq.values, label="Strategy", lw=1.3)
+        if bnh is not None:
+            ax[0].plot(bnh.index, bnh.values, label="Buy & Hold", lw=1.0, alpha=0.7)
+        ax[0].set_yscale("log")
+        ax[0].set_title(f"{symbol} {timeframe} — backtest equity (log)")
+        ax[0].legend(); ax[0].grid(alpha=0.3)
+        dd = eq / eq.cummax() - 1.0
+        ax[1].fill_between(dd.index, dd.values * 100, 0, color="red", alpha=0.4)
+        ax[1].set_title("Drawdown (%)"); ax[1].grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=110)
     return path
 
 
