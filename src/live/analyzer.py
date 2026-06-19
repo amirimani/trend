@@ -12,14 +12,17 @@ from __future__ import annotations
 
 from src.analysis import analyze_symbol
 from src.backtest import Costs
+from src.strategy import Params
 
 
 def run_analysis(symbol: str, fetch_fn, timeframe: str = "4h",
-                 since: str = "2020-01-01", costs: Costs | None = None) -> dict:
+                 since: str = "2020-01-01", costs: Costs | None = None,
+                 base: Params | None = None) -> dict:
     """Fetch history for `symbol` and auto-tune its parameters.
 
-    Returns the analyze_symbol() summary plus the symbol. Raises on data errors
-    (caller reports the failure to the user).
+    `base` carries account settings kept fixed during the search (leverage,
+    whether shorts are allowed). Returns the analyze_symbol() summary plus the
+    symbol. Raises on data errors (caller reports the failure to the user).
     """
     df = fetch_fn(symbol, timeframe, since)
     warmup = 220  # need enough bars for EMA200 + a meaningful sample
@@ -27,7 +30,7 @@ def run_analysis(symbol: str, fetch_fn, timeframe: str = "4h",
         raise ValueError(
             f"دادهٔ کافی برای {symbol} نیست (فقط {0 if df is None else len(df)} کندل)."
         )
-    summary = analyze_symbol(df, costs=costs, timeframe=timeframe)
+    summary = analyze_symbol(df, costs=costs, timeframe=timeframe, base=base)
     summary["symbol"] = symbol
     summary["timeframe"] = timeframe
     return summary

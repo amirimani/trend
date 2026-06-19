@@ -126,20 +126,27 @@ def _position_block(pos, rt):
     entry = pos["entry"]
     stop = pos.get("stop", pos.get("sl"))     # tolerate legacy key
     tp = pos.get("tp")
-    lines = [f"نوع: *{side}*  |  ورود: `${_g(entry)}`  ({_dt(pos.get('entry_time'))})"]
+    lev = pos.get("leverage", 1.0)
+    head = f"نوع: *{side}*"
+    if lev and lev > 1.0:
+        head += f" `{lev:g}x`"
+    lines = [f"{head}  |  ورود: `${_g(entry)}`  ({_dt(pos.get('entry_time'))})"]
     tline = f"🛑 استاپ فعلی `${_g(stop)}`"
     if tp:
         tline += f"  |  🎯 هدف `${_g(tp)}`"
     if pos.get("rr"):
         tline += f"  |  ⚖️ R/R `{pos['rr']:.2f}`"
     lines.append(tline)
+    if pos.get("liq"):
+        lines.append(f"☠️ لیکویید ≈ `${_g(pos['liq'])}`")
     if pos.get("mode") == "partial" and pos.get("partial_done"):
         lines.append(f"✅ سود جزئی گرفته شد | مابقی `{pos.get('remaining', 1)*100:.0f}%` در حال تریل")
     elif pos.get("mode") == "trailing" or (pos.get("mode") == "partial"):
         lines.append("🏃 خروج با تریلینگ‌استاپ (استاپ با روند بالا می‌آید)")
     price = rt.get("price")
     if price:
-        upnl = (price / entry - 1) * 100 if is_long else (entry / price - 1) * 100
+        move = (price / entry - 1) if is_long else (entry / price - 1)
+        upnl = move * 100 * lev      # leveraged P/L on margin
         risk = pos.get("risk") or abs(entry - stop)
         cur_r = ((price - entry) if is_long else (entry - price)) / risk if risk > 0 else float("nan")
         lines.append(f"قیمت فعلی `${_g(price)}` → {'🟢' if upnl >= 0 else '🔴'} "

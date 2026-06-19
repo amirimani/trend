@@ -27,7 +27,8 @@ class Params:
     atr_period: int = 14
     atr_sl_mult: float = 2.0   # stop-loss distance = atr_sl_mult * ATR
     atr_tp_mult: float = 4.0   # take-profit distance = atr_tp_mult * ATR
-    allow_short: bool = False  # spot BTC: long-only by default
+    allow_short: bool = False  # spot BTC: long-only by default; futures: enable
+    leverage: float = 1.0      # futures leverage (1 = spot/no leverage)
 
     # ---- Entry options -----------------------------------------------------
     entry_mode: str = "ema_cross"   # "ema_cross" | "donchian"

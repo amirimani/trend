@@ -65,7 +65,9 @@ def _b(name, default):
 
 
 def load_params() -> Params:
-    """The default/seed parameters for newly added symbols (until /analyze)."""
+    """The default/seed parameters for newly added symbols (until /analyze).
+    Also carries the account settings (leverage, shorts) that /analyze keeps
+    fixed while it searches the strategy knobs."""
     return Params(
         ema_fast=_i("EMA_FAST", 50),
         ema_slow=_i("EMA_SLOW", 200),
@@ -76,7 +78,18 @@ def load_params() -> Params:
         atr_sl_mult=_f("ATR_SL_MULT", 2.0),
         atr_tp_mult=_f("ATR_TP_MULT", 4.0),
         allow_short=_b("ALLOW_SHORT", False),
+        leverage=_f("LEVERAGE", 1.0),
     )
+
+
+# Futures cost/risk settings.
+TAKER_FEE = _f("TAKER_FEE", 0.0004)      # Binance USDT-M futures taker ~0.04%
+MAINT_MARGIN = _f("MAINT_MARGIN", 0.005)  # maintenance margin (liquidation price)
+
+
+def _costs():
+    from src.backtest import Costs
+    return Costs(fee=TAKER_FEE, maint_margin=MAINT_MARGIN)
 
 
 TIMEFRAME = os.getenv("TIMEFRAME", "4h")
@@ -196,7 +209,13 @@ def signal_from_row(row, ts, p: Params, alert_on_exit: bool = True) -> dict | No
         else:  # trailing -> no fixed target
             tgt = None
         rr = abs(tgt - price) / abs(price - sl) if (tgt and price != sl) else None
-        return {**base, "kind": "entry", "side": side, "sl": sl, "tp": tgt, "rr": rr}
+        lev = max(1.0, float(getattr(p, "leverage", 1.0)))
+        liq = None
+        if lev > 1.0:
+            dist = max(0.0, 1.0 / lev - MAINT_MARGIN)
+            liq = price * (1 - dist) if is_long else price * (1 + dist)
+        return {**base, "kind": "entry", "side": side, "sl": sl, "tp": tgt, "rr": rr,
+                "leverage": lev, "liq": liq}
     if alert_on_exit and bool(row["long_exit"]):
         return {**base, "kind": "exit", "side": "LONG"}
     if alert_on_exit and p.allow_short and bool(row["short_exit"]):
@@ -207,23 +226,26 @@ def signal_from_row(row, ts, p: Params, alert_on_exit: bool = True) -> dict | No
 def _open_live_position(alert: dict, p: Params) -> dict:
     """Build a persisted position from an entry alert, using the shared module."""
     side = 1 if alert["side"] == "LONG" else -1
-    pos = open_position(side, alert["price"], alert["atr"], p)
+    pos = open_position(side, alert["price"], alert["atr"], p, maint_margin=MAINT_MARGIN)
     pos["side_str"] = alert["side"]
     pos["entry_time"] = alert["time"].isoformat()
     pos["rr"] = alert.get("rr")
     pos["risk"] = abs(alert["price"] - pos["stop"])   # per-unit risk for R calc
-    pos["acc_pct"] = 0.0                               # accumulated realised %
+    pos["leverage"] = float(alert.get("leverage", 1.0))
+    pos["acc_pct"] = 0.0                               # accumulated realised % (on margin)
     pos["acc_r"] = 0.0                                 # accumulated realised R
     return pos
 
 
 def _leg_pct_r(pos: dict, price: float) -> tuple[float, float]:
+    """Return (pnl % on margin, R). The % is leveraged; R is leverage-independent."""
     e = pos["entry"]
+    lev = pos.get("leverage", 1.0)
     if pos["side"] == 1:
-        pct = (price / e - 1.0) * 100.0
+        pct = (price / e - 1.0) * 100.0 * lev
         r = (price - e) / pos["risk"] if pos["risk"] > 0 else float("nan")
     else:
-        pct = (e / price - 1.0) * 100.0
+        pct = (e / price - 1.0) * 100.0 * lev
         r = (e - price) / pos["risk"] if pos["risk"] > 0 else float("nan")
     return pct, r
 
@@ -261,12 +283,20 @@ def format_alert(a: dict, symbol: str, timeframe: str) -> str:
     word = "خرید (LONG)" if is_long else "فروش (SHORT)"
     entry, sl = a["price"], a["sl"]
     exit_line = _EXIT_DESC.get(a.get("exit_mode", "fixed"), _EXIT_DESC["fixed"])(a)
+    lev = a.get("leverage", 1.0)
+    lev_line = ""
+    if lev and lev > 1.0:
+        lev_line = f"⚡ اهرم: `{lev:g}x` (سود/زیان روی مارجین ×{lev:g})"
+        if a.get("liq"):
+            lev_line += f" | ☠️ لیکویید ≈ `${fmt_price(a['liq'])}`"
+        lev_line += "\n"
     return (
         f"{emoji} *سیگنال {word}* — `{symbol}` {timeframe}\n"
         f"⏰ بستن کندل: `{t}`\n\n"
         f"📍 ورود (در بازار/کندل بعد): `${fmt_price(entry)}`\n"
         f"{exit_line}\n"
-        f"🛑 حد ضرر (SL): `${fmt_price(sl)}`  ({(sl/entry-1)*100:+.2f}%)\n\n"
+        f"🛑 حد ضرر (SL): `${fmt_price(sl)}`  ({(sl/entry-1)*100:+.2f}%)\n"
+        f"{lev_line}\n"
         f"RSI: `{a['rsi']:.1f}` | EMA: `{fmt_price(a['ema_fast'])}/{fmt_price(a['ema_slow'])}`\n"
         f"_سیستم هشداردهنده است و سفارش ثبت نمی‌کند._"
     )
@@ -351,7 +381,10 @@ def _params_summary(p: dict) -> str:
     if p.get("htf_filter"):
         filt.append(f"روندِ تایم‌بالاتر ({p.get('htf') or 'خودکار'})")
     filt_s = "، ".join(filt) if filt else "بدون فیلتر"
-    return (f"ورود: {entry}\nفیلتر: {filt_s}\nخروج: {ex}")
+    lev = p.get("leverage", 1.0)
+    direction = "long/short" if p.get("allow_short") else "long-only"
+    extra = f"\nاهرم: {lev:g}x | جهت: {direction}" if (lev and lev != 1.0) else f"\nجهت: {direction}"
+    return (f"ورود: {entry}\nفیلتر: {filt_s}\nخروج: {ex}{extra}")
 
 
 def format_analysis(summary: dict, symbol: str, timeframe: str, footer: str = "") -> str:
@@ -476,7 +509,8 @@ def check_all(ctx: Context) -> None:
 # --------------------------------------------------------------------------- #
 def _analysis_worker(ctx: Context, symbol: str, auto: bool = False) -> None:
     try:
-        summary = run_analysis(symbol, ctx.fetch_history_fn, ctx.timeframe, ANALYZE_SINCE)
+        summary = run_analysis(symbol, ctx.fetch_history_fn, ctx.timeframe, ANALYZE_SINCE,
+                               costs=_costs(), base=ctx.default_params)
         verdict = quality_verdict(summary["out_sample"])
         with ctx.lock:
             wl = st.watchlist(ctx.state)
@@ -580,7 +614,7 @@ def _backtest_caption(symbol, p, m, bnh, df, timeframe) -> str:
 
 
 def _backtest_worker(ctx: Context, symbol: str) -> None:
-    from src.backtest import Costs, run_backtest
+    from src.backtest import run_backtest
     from src.metrics import compute_metrics
     try:
         with ctx.lock:
@@ -589,7 +623,7 @@ def _backtest_worker(ctx: Context, symbol: str) -> None:
         df = ctx.fetch_history_fn(symbol, ctx.timeframe, ANALYZE_SINCE)
         if df is None or len(df) < 250:
             raise ValueError("دادهٔ کافی نیست")
-        res = run_backtest(df, p, Costs())
+        res = run_backtest(df, p, _costs())
         ppy = periods_per_year(ctx.timeframe)
         m = compute_metrics(res.equity, res.trades, ppy=ppy)
         bnh = compute_metrics(res.bnh_equity, [], ppy=ppy)

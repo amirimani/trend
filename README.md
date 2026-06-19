@@ -26,6 +26,14 @@ The offline backtest and the live engine share **one** exit implementation
 (`src/position.py`), so live alerts behave exactly as backtested. `/analyze`
 grid-searches the entry filter, exit mode and regime filter per coin.
 
+**Futures / leverage:** set `ALLOW_SHORT=true` (so `/analyze` may also use short
+entries) and `LEVERAGE` (e.g. `3`). Leverage scales P/L on margin and the engine
+models the **isolated-margin liquidation price** (`MAINT_MARGIN`) — so backtests
+honestly show liquidation/blow-up when leverage is too high for the stop
+distance. Futures taker fee defaults to `TAKER_FEE=0.0004`. ⚠️ High leverage on a
+strategy without a proven out-of-sample edge is the fastest way to get
+liquidated — keep it low and only on coins that pass the OOS check.
+
 ## Data
 
 Real **1-minute BTC/USD candles from Bitstamp** (2012→2025), mirrored on GitHub

@@ -31,8 +31,14 @@ from __future__ import annotations
 from .strategy import Params
 
 
-def open_position(side: int, entry: float, atr: float, p: Params) -> dict:
-    """side: +1 long, -1 short. `entry` is the (slippage-adjusted) fill price."""
+def open_position(side: int, entry: float, atr: float, p: Params,
+                  maint_margin: float = 0.005) -> dict:
+    """side: +1 long, -1 short. `entry` is the (slippage-adjusted) fill price.
+
+    Computes the (isolated-margin) liquidation price from leverage so the
+    backtest/live can model getting liquidated before the stop when leverage is
+    high relative to the stop distance.
+    """
     pos = {
         "side": int(side),
         "entry": float(entry),
@@ -51,6 +57,13 @@ def open_position(side: int, entry: float, atr: float, p: Params) -> dict:
         pos["stop"] = entry + p.atr_sl_mult * atr
         pos["tp"] = entry - p.atr_tp_mult * atr if p.exit_mode == "fixed" else None
         pos["t1"] = entry - p.partial_tp_mult * atr if p.exit_mode == "partial" else None
+
+    lev = max(1.0, float(getattr(p, "leverage", 1.0)))
+    if lev > 1.0:
+        dist = max(0.0, 1.0 / lev - maint_margin)   # adverse move that wipes margin
+        pos["liq"] = entry * (1.0 - dist) if side == 1 else entry * (1.0 + dist)
+    else:
+        pos["liq"] = None
     return pos
 
 
@@ -63,13 +76,17 @@ def step(pos: dict, o: float, h: float, l: float, c: float,
     """Advance the open position by one closed bar; return the exit legs."""
     events: list[dict] = []
     stop = pos["stop"]
+    liq = pos.get("liq")
     rem = pos["remaining"]
 
     if pos["side"] == 1:  # ---- LONG ----
-        if l <= stop:
-            px = min(o, stop) if o <= stop else stop          # gap-through at open
-            events.append({"frac": rem, "price": px,
-                           "reason": "TRAIL" if pos["trailing_engaged"] else "SL"})
+        # Liquidation bites before the stop only if it sits ABOVE the stop.
+        loss_level = stop if liq is None else max(stop, liq)
+        if l <= loss_level:
+            px = min(o, loss_level) if o <= loss_level else loss_level   # gap at open
+            is_liq = liq is not None and liq > stop
+            reason = "LIQ" if is_liq else ("TRAIL" if pos["trailing_engaged"] else "SL")
+            events.append({"frac": rem, "price": px, "reason": reason})
             pos["remaining"] = 0.0
             return events
         if pos["mode"] == "fixed" and h >= pos["tp"]:
@@ -94,10 +111,12 @@ def step(pos: dict, o: float, h: float, l: float, c: float,
                 pos["stop"] = new_stop
                 pos["trailing_engaged"] = True
     else:                 # ---- SHORT ----
-        if h >= stop:
-            px = max(o, stop) if o >= stop else stop
-            events.append({"frac": rem, "price": px,
-                           "reason": "TRAIL" if pos["trailing_engaged"] else "SL"})
+        loss_level = stop if liq is None else min(stop, liq)
+        if h >= loss_level:
+            px = max(o, loss_level) if o >= loss_level else loss_level
+            is_liq = liq is not None and liq < stop
+            reason = "LIQ" if is_liq else ("TRAIL" if pos["trailing_engaged"] else "SL")
+            events.append({"frac": rem, "price": px, "reason": reason})
             pos["remaining"] = 0.0
             return events
         if pos["mode"] == "fixed" and l <= pos["tp"]:

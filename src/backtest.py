@@ -31,9 +31,10 @@ from .strategy import Params, generate_signals
 
 @dataclass
 class Costs:
-    fee: float = 0.001      # 0.10% per side (Binance spot taker)
+    fee: float = 0.001        # per-side taker fee (spot ~0.10%; futures ~0.04-0.05%)
     slippage: float = 0.0005  # 0.05% per side
     init_cash: float = 10_000.0
+    maint_margin: float = 0.005  # maintenance-margin rate for liquidation price
 
 
 @dataclass
@@ -73,18 +74,18 @@ def run_backtest(df: pd.DataFrame, p: Params, costs: Costs) -> BacktestResult:
 
     fee, slip = costs.fee, costs.slippage
     cash = costs.init_cash
+    lev = max(1.0, float(getattr(p, "leverage", 1.0)))
     n = len(df)
 
-    # Position state (supports partial exits via `pos["remaining"]`).
+    # Position state (isolated margin = full equity; supports partial exits and
+    # leverage). One unified realised-pnl model for both long and short.
     pos = None
-    qty0 = 0.0            # units opened at entry (full size)
+    qty0 = 0.0            # units (asset) opened at entry = leverage * margin / price
     entry_price = 0.0
     entry_time = None
     entry_bar = 0
-    entry_capital = 0.0
-    realized_cash = 0.0   # long: proceeds banked from exited legs
-    realized_pnl = 0.0    # short: pnl banked from covered legs
-    entry_fee = 0.0
+    entry_capital = 0.0   # margin committed (full equity at entry)
+    realized_pnl = 0.0    # banked pnl from exited legs, net of fees (incl. entry fee)
     last_reason = None
 
     equity = np.empty(n, dtype="float64")
@@ -104,20 +105,19 @@ def run_backtest(df: pd.DataFrame, p: Params, costs: Costs) -> BacktestResult:
                 units = leg["frac"] * qty0
                 last_reason = leg["reason"]
                 if pos["side"] == 1:
-                    realized_cash += units * sell_fill(leg["price"]) * (1.0 - fee)
+                    px = sell_fill(leg["price"])
+                    realized_pnl += units * (px - entry_price) - units * px * fee
                 else:
                     px = buy_fill(leg["price"])
                     realized_pnl += units * (entry_price - px) - units * px * fee
             if pos["remaining"] <= 1e-12:    # fully closed -> record the trade
-                if pos["side"] == 1:
-                    cash = realized_cash
-                else:
-                    cash = entry_capital - entry_fee + realized_pnl
+                cash = max(0.0, entry_capital + realized_pnl)   # isolated: can't go < 0
                 pnl = cash - entry_capital
                 trades.append(Trade(
                     side="long" if pos["side"] == 1 else "short",
                     entry_time=entry_time, entry_price=entry_price,
-                    exit_time=idx[i], exit_price=sell_fill(c[i]) if pos["side"] == 1 else buy_fill(c[i]),
+                    exit_time=idx[i],
+                    exit_price=sell_fill(c[i]) if pos["side"] == 1 else buy_fill(c[i]),
                     exit_reason=last_reason, ret=pnl / entry_capital, pnl=pnl,
                     bars_held=i - entry_bar,
                 ))
@@ -125,35 +125,28 @@ def run_backtest(df: pd.DataFrame, p: Params, costs: Costs) -> BacktestResult:
 
         # ---- 2. Look for an entry to execute on THIS bar's open --------------
         # Entry signal was generated at bar i-1's close (acted on i's open).
-        if pos is None and i > 0:
+        if pos is None and i > 0 and cash > 0:
             want_long = bool(long_entry[i - 1])
             want_short = bool(short_entry[i - 1]) and p.allow_short
             a = atr[i - 1]
             if (want_long or want_short) and np.isfinite(a) and a > 0:
                 entry_capital = cash
-                if want_long:
-                    entry_price = buy_fill(o[i])
-                    qty0 = (cash * (1.0 - fee)) / entry_price  # entry fee embedded
-                    entry_fee = 0.0
-                    realized_cash = 0.0
-                    pos = open_position(1, entry_price, a, p)
-                else:
-                    entry_price = sell_fill(o[i])
-                    qty0 = cash / entry_price                  # notional == cash
-                    entry_fee = qty0 * entry_price * fee       # charged explicitly
-                    realized_pnl = 0.0
-                    pos = open_position(-1, entry_price, a, p)
+                notional = lev * cash
+                side = 1 if want_long else -1
+                entry_price = buy_fill(o[i]) if want_long else sell_fill(o[i])
+                qty0 = notional / entry_price
+                realized_pnl = -notional * fee          # entry fee on full notional
+                pos = open_position(side, entry_price, a, p,
+                                    maint_margin=costs.maint_margin)
                 entry_time = idx[i]
                 entry_bar = i
 
         # ---- 3. Mark-to-market equity at THIS bar's close --------------------
         if pos is not None:
             rem_units = pos["remaining"] * qty0
-            if pos["side"] == 1:
-                equity[i] = realized_cash + rem_units * c[i]
-            else:
-                equity[i] = (entry_capital - entry_fee + realized_pnl
-                             + rem_units * (entry_price - c[i]))
+            unreal = (rem_units * (c[i] - entry_price) if pos["side"] == 1
+                      else rem_units * (entry_price - c[i]))
+            equity[i] = max(0.0, entry_capital + realized_pnl + unreal)
         else:
             equity[i] = cash
 
