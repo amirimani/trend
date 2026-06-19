@@ -1,0 +1,7 @@
+# Large raw data archive (~91 MB) - re-downloaded automatically by data_prep.py
+data/*.csv.gz
+# Derived 4h dataset - rebuilt from raw
+data/*.parquet
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

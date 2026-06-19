@@ -1,0 +1,6 @@
+pandas>=2.0
+numpy>=1.24
+pyarrow>=12.0
+matplotlib>=3.7
+# Optional, only for fetching genuine Binance BTC/USDT data (src/fetch_binance.py):
+# ccxt>=4.0
