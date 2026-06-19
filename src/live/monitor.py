@@ -1,38 +1,44 @@
 """
-Live market monitor for the EMA-cross + RSI-filter + ATR-stop strategy.
+Multi-symbol live market monitor — Telegram-managed.
 
-It polls Binance for closed 4h candles and, when a fresh entry (or trend-flip
-exit) signal appears on the just-closed bar, sends a Telegram alert describing
-the proposed position: direction, entry, stop-loss, take-profit and R/R.
+For every *enabled* symbol in the watchlist it polls Binance for closed 4h
+candles and, when a fresh entry signal appears, sends a Telegram alert with the
+proposed position (entry / SL / TP / R-R). It then tracks that position and,
+when it resolves (TP, SL or trend-flip), sends a follow-up result with the
+realised P/L and R. Each symbol uses its own parameters.
+
+Symbols are managed live from Telegram (/add /remove /enable /disable) and each
+can be auto-tuned with /analyze (the engine fetches that symbol's history and
+grid-searches its best parameters). State (watchlist, params, positions,
+history) is persisted on the mounted volume.
 
 This is an ADVISORY service — it never places orders.
 
-Look-ahead safety: signals are evaluated only on *closed* candles (the live,
-still-forming candle is dropped by the feed), and each candle is alerted at most
-once (deduplicated via a small state file on the mounted volume).
-
 Config via environment variables (see .env.example):
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  SYMBOL=BTC/USDT  TIMEFRAME=4h  POLL_SECONDS=300
+  WATCHLIST=BTC/USDT,SOL/USDT,ETH/USDT   (seeded on first run)
+  TIMEFRAME=4h  POLL_SECONDS=300  ANALYZE_SINCE=2020-01-01
   EMA_FAST EMA_SLOW RSI_PERIOD RSI_LONG_MIN RSI_LONG_MAX
-  ATR_PERIOD ATR_SL_MULT ATR_TP_MULT ALLOW_SHORT ALERT_ON_EXIT
+  ATR_PERIOD ATR_SL_MULT ATR_TP_MULT ALLOW_SHORT
   STATE_FILE=/data/state.json
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
-from src.strategy import Params, generate_signals
-from src.live.feed import fetch_recent
+from src.live.analyzer import run_analysis
+from src.live.feed import fetch_history, fetch_recent
 from src.live.notifier import TelegramNotifier
+from src.live import state as st
+from src.strategy import Params, generate_signals
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +63,7 @@ def _b(name, default):
 
 
 def load_params() -> Params:
+    """The default/seed parameters for newly added symbols (until /analyze)."""
     return Params(
         ema_fast=_i("EMA_FAST", 50),
         ema_slow=_i("EMA_SLOW", 200),
@@ -70,141 +77,141 @@ def load_params() -> Params:
     )
 
 
-SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 TIMEFRAME = os.getenv("TIMEFRAME", "4h")
 POLL_SECONDS = _i("POLL_SECONDS", 300)
-STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
+ANALYZE_SINCE = os.getenv("ANALYZE_SINCE", "2020-01-01")
+WATCHLIST_SEED = [s for s in os.getenv("WATCHLIST", "BTC/USDT").split(",") if s.strip()]
 
 
 # --------------------------------------------------------------------------- #
-# State (dedup across restarts)
+# Shared runtime context (one per process)
 # --------------------------------------------------------------------------- #
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE) as fh:
-            return json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+@dataclass
+class Context:
+    notifier: TelegramNotifier
+    state: dict
+    default_params: Params
+    timeframe: str = TIMEFRAME
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    runtime: dict = field(default_factory=lambda: {
+        "started_at": datetime.now(timezone.utc).isoformat(), "symbols": {}})
+    analyzing: set = field(default_factory=set)
+    # injected so tests can substitute local data
+    fetch_recent_fn: callable = fetch_recent
+    fetch_history_fn: callable = fetch_history
 
-
-def save_state(state: dict) -> None:
-    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(state, fh)
-    os.replace(tmp, STATE_FILE)
+    def start_analysis(self, symbol: str) -> str:
+        symbol = st.normalize_symbol(symbol)
+        if symbol in self.analyzing:
+            return f"⏳ تحلیل `{symbol}` همین الان در حال اجراست."
+        self.analyzing.add(symbol)
+        threading.Thread(target=_analysis_worker, args=(self, symbol), daemon=True).start()
+        return f"🔬 تحلیل `{symbol}` شروع شد؛ نتیجه را به‌زودی می‌فرستم…"
 
 
 # --------------------------------------------------------------------------- #
-# Signal evaluation on the most recently closed bar
+# Signal evaluation on a single closed bar
 # --------------------------------------------------------------------------- #
 def signal_from_row(row, ts, p: Params, alert_on_exit: bool = True) -> dict | None:
-    """Return an alert dict for a single (closed) signal row, or None."""
     price = float(row["close"])
     atr = float(row["atr"])
     rsi = float(row["rsi"])
-
     if not np.isfinite(atr) or atr <= 0:
         return None
-
     base = {
-        "time": ts,
-        "price": price,
-        "atr": atr,
-        "rsi": rsi,
-        "ema_fast": float(row["ema_fast"]),
-        "ema_slow": float(row["ema_slow"]),
+        "time": ts, "price": price, "atr": atr, "rsi": rsi,
+        "ema_fast": float(row["ema_fast"]), "ema_slow": float(row["ema_slow"]),
     }
-
     if bool(row["long_entry"]):
         sl = price - p.atr_sl_mult * atr
         tp = price + p.atr_tp_mult * atr
         rr = (tp - price) / (price - sl) if price > sl else float("nan")
         return {**base, "kind": "entry", "side": "LONG", "sl": sl, "tp": tp, "rr": rr}
-
     if p.allow_short and bool(row["short_entry"]):
         sl = price + p.atr_sl_mult * atr
         tp = price - p.atr_tp_mult * atr
         rr = (price - tp) / (sl - price) if sl > price else float("nan")
         return {**base, "kind": "entry", "side": "SHORT", "sl": sl, "tp": tp, "rr": rr}
-
     if alert_on_exit and bool(row["long_exit"]):
         return {**base, "kind": "exit", "side": "LONG"}
     if alert_on_exit and p.allow_short and bool(row["short_exit"]):
         return {**base, "kind": "exit", "side": "SHORT"}
-
     return None
 
 
-def evaluate_last_bar(df, p: Params, alert_on_exit: bool = True) -> dict | None:
-    """Return an alert dict for the last closed bar, or None if no signal."""
-    sig = generate_signals(df, p)
-    return signal_from_row(sig.iloc[-1], sig.index[-1], p, alert_on_exit)
-
-
 def check_exit(pos: dict, row, ts, p: Params) -> dict | None:
-    """
-    Has the tracked position `pos` been resolved on this closed bar?
-
-    Mirrors the backtest exit rules: stop checked before target (pessimistic),
-    gap-through fills at the bar open, and a trend-flip (opposite EMA cross)
-    closes at the bar close. Returns an exit dict or None.
-    """
+    """Mirror the backtest exit rules (stop-before-target, gap-through at open)."""
     o, h, l, c = (float(row["open"]), float(row["high"]),
                   float(row["low"]), float(row["close"]))
     sl, tp = pos["sl"], pos["tp"]
-
     if pos["side"] == "LONG":
         if l <= sl:
-            px = o if o <= sl else sl       # gap-down through the stop
-            return {"exit_price": px, "reason": "SL", "time": ts}
+            return {"exit_price": (o if o <= sl else sl), "reason": "SL", "time": ts}
         if h >= tp:
-            px = o if o >= tp else tp        # gap-up through the target
-            return {"exit_price": px, "reason": "TP", "time": ts}
+            return {"exit_price": (o if o >= tp else tp), "reason": "TP", "time": ts}
         if bool(row["long_exit"]):
             return {"exit_price": c, "reason": "EXIT", "time": ts}
-    else:  # SHORT
+    else:
         if h >= sl:
-            px = o if o >= sl else sl
-            return {"exit_price": px, "reason": "SL", "time": ts}
+            return {"exit_price": (o if o >= sl else sl), "reason": "SL", "time": ts}
         if l <= tp:
-            px = o if o <= tp else tp
-            return {"exit_price": px, "reason": "TP", "time": ts}
+            return {"exit_price": (o if o <= tp else tp), "reason": "TP", "time": ts}
         if bool(row["short_exit"]):
             return {"exit_price": c, "reason": "EXIT", "time": ts}
     return None
 
 
+def realised(pos: dict, ex: dict) -> dict:
+    entry, exit_px = pos["entry"], ex["exit_price"]
+    is_long = pos["side"] == "LONG"
+    pnl_pct = (exit_px / entry - 1.0) * 100.0 if is_long else (entry / exit_px - 1.0) * 100.0
+    risk = abs(entry - pos["sl"])
+    reward = (exit_px - entry) if is_long else (entry - exit_px)
+    r_mult = reward / risk if risk > 0 else float("nan")
+    bars = max(1, round((ex["time"] - pd.Timestamp(pos["entry_time"])).total_seconds() / (4 * 3600)))
+    return {
+        "side": pos["side"], "entry": entry, "exit": exit_px, "reason": ex["reason"],
+        "pnl_pct": pnl_pct, "r": r_mult, "bars": bars,
+        "entry_time": pos["entry_time"], "exit_time": ex["time"].isoformat(),
+    }
+
+
+def _position_dict(alert: dict) -> dict:
+    return {
+        "side": alert["side"], "entry": alert["price"], "sl": alert["sl"],
+        "tp": alert["tp"], "rr": alert["rr"], "entry_time": alert["time"].isoformat(),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Message formatting (Persian)
 # --------------------------------------------------------------------------- #
+def fmt_price(x: float) -> str:
+    """Readable price across scales: BTC ($102,300), SOL ($148.20), DOGE ($0.1234)."""
+    ax = abs(x)
+    if ax >= 1000:
+        return f"{x:,.0f}"
+    if ax >= 1:
+        return f"{x:,.2f}"
+    if ax >= 0.01:
+        return f"{x:.4f}"
+    return f"{x:.6f}"
+
+
 def format_alert(a: dict, symbol: str, timeframe: str) -> str:
     t = a["time"].strftime("%Y-%m-%d %H:%M UTC")
-    if a["kind"] == "exit":
-        emoji = "⚪️"
-        head = f"{emoji} *سیگنال خروج / فلیپ روند* — `{symbol}` {timeframe}"
-        body = (
-            f"کراس معکوس EMA رخ داد؛ اگر پوزیشن *{a['side']}* باز داری، خروج/بستن رو در نظر بگیر.\n"
-            f"قیمت فعلی: `${a['price']:,.0f}`"
-        )
-        meta = f"RSI: `{a['rsi']:.1f}` | EMA: `{a['ema_fast']:,.0f}/{a['ema_slow']:,.0f}`"
-        return f"{head}\n⏰ بستن کندل: `{t}`\n\n{body}\n\n{meta}"
-
     is_long = a["side"] == "LONG"
     emoji = "🟢" if is_long else "🔴"
     word = "خرید (LONG)" if is_long else "فروش (SHORT)"
     entry, sl, tp = a["price"], a["sl"], a["tp"]
-    tp_pct = (tp / entry - 1) * 100
-    sl_pct = (sl / entry - 1) * 100
     return (
         f"{emoji} *سیگنال {word}* — `{symbol}` {timeframe}\n"
         f"⏰ بستن کندل: `{t}`\n\n"
-        f"📍 ورود (در بازار/کندل بعد): `${entry:,.1f}`\n"
-        f"🎯 حد سود (TP): `${tp:,.1f}`  ({tp_pct:+.2f}%)\n"
-        f"🛑 حد ضرر (SL): `${sl:,.1f}`  ({sl_pct:+.2f}%)\n"
+        f"📍 ورود (در بازار/کندل بعد): `${fmt_price(entry)}`\n"
+        f"🎯 حد سود (TP): `${fmt_price(tp)}`  ({(tp/entry-1)*100:+.2f}%)\n"
+        f"🛑 حد ضرر (SL): `${fmt_price(sl)}`  ({(sl/entry-1)*100:+.2f}%)\n"
         f"⚖️ نسبت R/R: `{a['rr']:.2f}`\n\n"
-        f"RSI: `{a['rsi']:.1f}` | EMA: `{a['ema_fast']:,.0f}/{a['ema_slow']:,.0f}` | "
-        f"ATR: `{a['atr']:,.0f}`\n"
+        f"RSI: `{a['rsi']:.1f}` | EMA: `{fmt_price(a['ema_fast'])}/{fmt_price(a['ema_slow'])}`\n"
         f"_سیستم هشداردهنده است و سفارش ثبت نمی‌کند._"
     )
 
@@ -216,69 +223,49 @@ _REASON_FA = {
 }
 
 
-def realised(pos: dict, ex: dict) -> dict:
-    """Compute the realised P/L of a closed position (shared by alerts + stats)."""
-    entry = pos["entry"]
-    exit_px = ex["exit_price"]
-    is_long = pos["side"] == "LONG"
-    pnl_pct = (exit_px / entry - 1.0) * 100.0 if is_long else (entry / exit_px - 1.0) * 100.0
-    risk = abs(entry - pos["sl"])
-    reward = (exit_px - entry) if is_long else (entry - exit_px)
-    r_mult = reward / risk if risk > 0 else float("nan")
-    entry_ts = pd.Timestamp(pos["entry_time"])
-    bars = max(1, round((ex["time"] - entry_ts).total_seconds() / (4 * 3600)))
-    return {
-        "side": pos["side"],
-        "entry": entry,
-        "exit": exit_px,
-        "reason": ex["reason"],
-        "pnl_pct": pnl_pct,
-        "r": r_mult,
-        "bars": bars,
-        "entry_time": pos["entry_time"],
-        "exit_time": ex["time"].isoformat(),
-    }
-
-
 def format_result(pos: dict, ex: dict, symbol: str, timeframe: str) -> str:
-    """Announce the realised P/L of a closed position."""
     r = realised(pos, ex)
-    entry, exit_px, pnl_pct, r_mult = r["entry"], r["exit"], r["pnl_pct"], r["r"]
-    bars = r["bars"]
-    days = bars * 4 / 24
-
-    win = pnl_pct >= 0
-    head_emoji = "✅" if win else "❌"
-    verb = "سود" if win else "ضرر"
+    days = r["bars"] * 4 / 24
+    win = r["pnl_pct"] >= 0
     return (
-        f"{head_emoji} *نتیجهٔ پوزیشن {pos['side']} بسته شد* — `{symbol}` {timeframe}\n"
+        f"{'✅' if win else '❌'} *نتیجهٔ پوزیشن {pos['side']} بسته شد* — `{symbol}` {timeframe}\n"
         f"دلیل خروج: {_REASON_FA.get(ex['reason'], ex['reason'])}\n\n"
-        f"📍 ورود: `${entry:,.1f}`\n"
-        f"🚪 خروج: `${exit_px:,.1f}`\n"
-        f"💰 {verb}: `{pnl_pct:+.2f}%`  (R: `{r_mult:+.2f}`)\n"
-        f"🕒 مدت نگهداری: `{bars}` کندل (~`{days:.1f}` روز)\n"
+        f"📍 ورود: `${fmt_price(r['entry'])}`\n"
+        f"🚪 خروج: `${fmt_price(r['exit'])}`\n"
+        f"💰 {'سود' if win else 'ضرر'}: `{r['pnl_pct']:+.2f}%`  (R: `{r['r']:+.2f}`)\n"
+        f"🕒 مدت نگهداری: `{r['bars']}` کندل (~`{days:.1f}` روز)\n"
         f"⏰ زمان خروج: `{ex['time'].strftime('%Y-%m-%d %H:%M UTC')}`\n"
         f"_سود/زیان بر مبنای قیمت و بدون احتساب کارمزد است._"
     )
 
 
-# --------------------------------------------------------------------------- #
-# One polling cycle
-# --------------------------------------------------------------------------- #
-def _register_position(state: dict, alert: dict) -> None:
-    state["position"] = {
-        "side": alert["side"],
-        "entry": alert["price"],
-        "sl": alert["sl"],
-        "tp": alert["tp"],
-        "rr": alert["rr"],
-        "entry_time": alert["time"].isoformat(),
-    }
+def format_analysis(summary: dict, symbol: str, timeframe: str) -> str:
+    p = summary["params"]
+    is_m, oos = summary["in_sample"], summary["out_sample"]
+    tuned = "بهینه‌شده" if summary.get("tuned") else "پیش‌فرض (بهینه‌سازی نتیجه نداد)"
+    return (
+        f"🔬 *تحلیل {symbol}* — {timeframe}  ({tuned})\n"
+        f"بازه: {summary['range'][0][:10]} → {summary['range'][1][:10]} "
+        f"({summary['n_bars']} کندل)\n\n"
+        f"⚙️ پارامترهای انتخابی:\n"
+        f"EMA `{p['ema_fast']}/{p['ema_slow']}` | RSI<`{p['rsi_long_max']}` | "
+        f"SL `{p['atr_sl_mult']}×ATR` / TP `{p['atr_tp_mult']}×ATR`\n\n"
+        f"📊 *درون‌نمونه (انتخاب):* بازده `{is_m['total_return']*100:+.1f}%` | "
+        f"Sharpe `{is_m['sharpe']:.2f}` | برد `{is_m['win_rate']*100:.0f}%` | "
+        f"معاملات `{is_m['num_trades']}`\n"
+        f"🧪 *برون‌نمونه (آزمون صادقانه):* بازده `{oos['total_return']*100:+.1f}%` | "
+        f"Sharpe `{oos['sharpe']:.2f}` | برد `{oos['win_rate']*100:.0f}%` | "
+        f"DD `{oos['max_drawdown']*100:.1f}%` | معاملات `{oos['num_trades']}`\n\n"
+        f"این پارامترها ذخیره شد و از این پس برای رصد `{symbol}` استفاده می‌شود."
+    )
 
 
-def _update_runtime(runtime: dict, sig, latest_ts) -> None:
+# --------------------------------------------------------------------------- #
+# Per-symbol processing
+# --------------------------------------------------------------------------- #
+def _update_runtime(runtime: dict, symbol: str, sig, latest_ts) -> None:
     last = sig.loc[latest_ts]
-    runtime.update({
+    runtime.setdefault("symbols", {})[symbol] = {
         "last_check": datetime.now(timezone.utc).isoformat(),
         "last_bar": latest_ts.isoformat(),
         "price": float(last["close"]),
@@ -286,149 +273,154 @@ def _update_runtime(runtime: dict, sig, latest_ts) -> None:
         "ema_fast": float(last["ema_fast"]),
         "ema_slow": float(last["ema_slow"]),
         "atr": float(last["atr"]),
-    })
+    }
 
 
-def check_once(p: Params, notifier: TelegramNotifier, state: dict,
-               runtime: dict | None = None, lock: "threading.Lock | None" = None):
-    """One polling cycle. Network fetch happens outside the lock; only the
-    state mutation + runtime snapshot are guarded so command reads stay fast."""
-    if runtime is None:
-        runtime = {}
-    nolock = lock is None
+def _process_bars(entry: dict, sig, p: Params, notifier, symbol: str, timeframe: str) -> None:
+    latest_ts = sig.index[-1]
+    if not entry.get("last_bar"):
+        entry["last_bar"] = latest_ts.isoformat()      # first run: no replay
+        entry.setdefault("history", [])
+        return
+    last_seen = pd.Timestamp(entry["last_bar"])
+    for ts in sig.index[sig.index > last_seen]:
+        row = sig.loc[ts]
+        pos = entry.get("position")
+        if pos:
+            ex = check_exit(pos, row, ts, p)
+            if ex is not None:
+                notifier.send(format_result(pos, ex, symbol, timeframe))
+                entry.setdefault("history", []).append(realised(pos, ex))
+                entry["history"] = entry["history"][-500:]
+                entry["position"] = None
+        if not entry.get("position"):
+            s = signal_from_row(row, ts, p, alert_on_exit=False)
+            if s and s["kind"] == "entry":
+                notifier.send(format_alert(s, symbol, timeframe))
+                entry["position"] = _position_dict(s)
+    entry["last_bar"] = latest_ts.isoformat()
+
+
+def process_symbol(ctx: Context, symbol: str) -> None:
+    with ctx.lock:
+        entry = st.watchlist(ctx.state).get(symbol)
+        if not entry or not entry.get("enabled"):
+            return
+        p = st.dict_to_params(entry["params"])
 
     warmup = max(p.ema_slow, p.atr_period, p.rsi_period) + 20
-    df = fetch_recent(SYMBOL, TIMEFRAME, limit=max(400, warmup))  # no lock (slow I/O)
+    df = ctx.fetch_recent_fn(symbol, ctx.timeframe, max(400, warmup))  # slow I/O, no lock
     if len(df) < warmup:
-        log.warning("Not enough candles (%d) for warmup (%d).", len(df), warmup)
-        return state
-
+        log.warning("%s: only %d candles (< warmup %d).", symbol, len(df), warmup)
+        return
     sig = generate_signals(df, p)
     latest_ts = sig.index[-1]
 
-    if not nolock:
-        lock.acquire()
+    with ctx.lock:
+        entry = st.watchlist(ctx.state).get(symbol)  # re-read (may have changed)
+        if entry is None or not entry.get("enabled"):
+            return
+        _update_runtime(ctx.runtime, symbol, sig, latest_ts)
+        _process_bars(entry, sig, p, ctx.notifier, symbol, ctx.timeframe)
+        st.save_state(ctx.state)
+
+
+def check_all(ctx: Context) -> None:
+    with ctx.lock:
+        symbols = [s for s, e in st.watchlist(ctx.state).items() if e.get("enabled")]
+    for symbol in symbols:
+        try:
+            process_symbol(ctx, symbol)
+        except Exception as e:
+            log.exception("%s cycle error: %s", symbol, e)
+
+
+# --------------------------------------------------------------------------- #
+# Background analysis worker
+# --------------------------------------------------------------------------- #
+def _analysis_worker(ctx: Context, symbol: str) -> None:
     try:
-        _update_runtime(runtime, sig, latest_ts)
-
-        # First run ever: don't replay history, just mark the latest bar.
-        if "last_bar" not in state:
-            state["last_bar"] = latest_ts.isoformat()
-            state.setdefault("history", [])
-            save_state(state)
-            log.info("Initialised at %s (no historical replay).", latest_ts)
-            return state
-
-        last_seen = pd.Timestamp(state["last_bar"])
-        new_bars = sig.index[sig.index > last_seen]
-        if len(new_bars) == 0:
-            return state
-
-        for ts in new_bars:
-            row = sig.loc[ts]
-
-            # 1) Resolve an open tracked position on this bar.
-            pos = state.get("position")
-            if pos:
-                ex = check_exit(pos, row, ts, p)
-                if ex is not None:
-                    notifier.send(format_result(pos, ex, SYMBOL, TIMEFRAME))
-                    trade = realised(pos, ex)
-                    state.setdefault("history", []).append(trade)
-                    state["history"] = state["history"][-500:]  # cap growth
-                    log.info("Closed %s via %s @ %s (entry %s, %.2f%%)",
-                             pos["side"], ex["reason"], ts, pos["entry"], trade["pnl_pct"])
-                    state["position"] = None
-
-            # 2) If flat, look for a new entry to open (and track) a position.
-            #    A trend-flip exit is reported as a position result above, so we
-            #    don't emit standalone "consider exiting" noise when flat.
-            if not state.get("position"):
-                s = signal_from_row(row, ts, p, alert_on_exit=False)
-                if s and s["kind"] == "entry":
-                    notifier.send(format_alert(s, SYMBOL, TIMEFRAME))
-                    _register_position(state, s)
-                    log.info("Entry %s @ %s price %s", s["side"], ts, s["price"])
-
-        state["last_bar"] = latest_ts.isoformat()
-        save_state(state)
-        return state
+        summary = run_analysis(symbol, ctx.fetch_history_fn, ctx.timeframe, ANALYZE_SINCE)
+        with ctx.lock:
+            wl = st.watchlist(ctx.state)
+            if symbol not in wl:
+                wl[symbol] = st.new_entry(st.dict_to_params(summary["params"]))
+            wl[symbol]["params"] = summary["params"]
+            wl[symbol]["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+            wl[symbol]["analysis"] = {
+                "tuned": summary["tuned"], "range": summary["range"],
+                "in_sample": summary["in_sample"], "out_sample": summary["out_sample"],
+            }
+            st.save_state(ctx.state)
+        ctx.notifier.send(format_analysis(summary, symbol, ctx.timeframe))
+        log.info("Analysis done for %s (tuned=%s).", symbol, summary["tuned"])
+    except Exception as e:
+        log.exception("Analysis failed for %s: %s", symbol, e)
+        ctx.notifier.send(f"❌ تحلیل `{symbol}` ناموفق بود: {e}")
     finally:
-        if not nolock:
-            lock.release()
+        ctx.analyzing.discard(symbol)
 
 
 # --------------------------------------------------------------------------- #
-# Telegram command listener (runs in its own thread)
+# Telegram command listener
 # --------------------------------------------------------------------------- #
-def command_loop(notifier: TelegramNotifier, state: dict, runtime: dict,
-                 lock: threading.Lock, p: Params):
+def command_loop(ctx: Context) -> None:
     from src.live import commands
 
-    if not notifier.enabled:
+    if not ctx.notifier.enabled:
         log.warning("Telegram not configured -> command listener disabled.")
         return
-
-    notifier.set_my_commands(commands.MENU)
-    offset = notifier.drain_updates()  # skip any backlog so we don't replay old cmds
+    ctx.notifier.set_my_commands(commands.MENU)
+    offset = ctx.notifier.drain_updates()
     log.info("Command listener ready (offset=%s).", offset)
-
     while True:
         try:
-            updates = notifier.get_updates(offset=offset, timeout=25)
-            for u in updates:
+            for u in ctx.notifier.get_updates(offset=offset, timeout=25):
                 offset = u["update_id"] + 1
                 msg = u.get("message") or u.get("edited_message") or {}
-                if str(msg.get("chat", {}).get("id")) != str(notifier.chat_id):
-                    continue  # only respond to the configured owner chat
+                if str(msg.get("chat", {}).get("id")) != str(ctx.notifier.chat_id):
+                    continue
                 text = (msg.get("text") or "").strip()
                 if not text.startswith("/"):
                     continue
-                with lock:
-                    reply = commands.dispatch(text, state, runtime, p, SYMBOL, TIMEFRAME)
+                reply = commands.dispatch(text, ctx)
                 if reply:
-                    notifier.send(reply)
-        except Exception as e:  # keep the listener alive through transient errors
+                    ctx.notifier.send(reply)
+        except Exception as e:
             log.exception("Command loop error: %s", e)
             time.sleep(5)
 
 
-def main():
-    p = load_params()
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def build_context() -> Context:
     notifier = TelegramNotifier()
-    state = load_state()
-    state.setdefault("history", [])
-    runtime = {"started_at": datetime.now(timezone.utc).isoformat()}
-    lock = threading.Lock()
+    default_p = load_params()
+    state = st.migrate(st.load_state(), st.normalize_symbol(WATCHLIST_SEED[0]),
+                       default_p, seed_symbols=WATCHLIST_SEED)
+    st.save_state(state)
+    return Context(notifier=notifier, state=state, default_params=default_p)
 
-    log.info("Live monitor starting: %s %s | params=%s | poll=%ss | shorts=%s",
-             SYMBOL, TIMEFRAME, p, POLL_SECONDS, p.allow_short)
-    notifier.send(
-        f"🤖 *ربات رصد بازار فعال شد*\n`{SYMBOL}` {TIMEFRAME} | "
-        f"EMA `{p.ema_fast}/{p.ema_slow}` | RSI `{p.rsi_period}` | "
-        f"SL `{p.atr_sl_mult}×ATR` / TP `{p.atr_tp_mult}×ATR`\n"
-        f"شروع: `{datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}`\n"
+
+def main():
+    ctx = build_context()
+    symbols = list(st.watchlist(ctx.state))
+    log.info("Live monitor: watching %s | poll=%ss", symbols, POLL_SECONDS)
+    ctx.notifier.send(
+        "🤖 *موتور رصد چندارزی فعال شد*\n"
+        f"واچ‌لیست: {', '.join(f'`{s}`' for s in symbols) or '—'}\n"
+        f"تایم‌فریم: {TIMEFRAME} | بازهٔ بررسی: هر {POLL_SECONDS//60} دقیقه\n"
         f"برای فهرست دستورها /help را بفرست."
     )
-
-    # Command listener in a daemon thread; market polling in the main thread.
-    t = threading.Thread(
-        target=command_loop, args=(notifier, state, runtime, lock, p), daemon=True
-    )
-    t.start()
-
+    threading.Thread(target=command_loop, args=(ctx,), daemon=True).start()
     while True:
         try:
-            check_once(p, notifier, state, runtime, lock)
-        except Exception as e:  # never let the loop die on a transient error
+            check_all(ctx)
+        except Exception as e:
             log.exception("Cycle error: %s", e)
         time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    import sys
-    if "--once" in sys.argv:
-        p = load_params()
-        check_once(p, TelegramNotifier(), load_state())
-    else:
-        main()
+    main()

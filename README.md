@@ -92,17 +92,22 @@ Total return **+633.7%**, CAGR 32.8%, Sharpe 0.76, **max drawdown −81.5%**.
 - Trade counts are low (trend strategies trade rarely), so per-period metrics are
   noisy — treat single-run OOS numbers as indicative, not precise.
 
-## Live monitoring service (Docker → Telegram alerts)
+## Live engine — multi-symbol, Telegram-managed (Docker)
 
-A separate, always-on service polls Binance for closed 4h candles and sends a
-**Telegram alert** the moment an entry signal appears, describing the proposed
-position: direction, entry, TP, SL and R/R. It then **tracks that position** and
-sends a follow-up **result message** once the trade plays out (TP hit, SL hit, or
-a trend-flip exit), reporting the realised profit/loss and R multiple. It is an
-**advisory** service — it never places orders.
+An always-on service that watches **many symbols at once**, each with its own
+parameters, open position and trade history. For every enabled symbol it polls
+Binance for closed 4h candles and sends a **Telegram alert** on each entry signal
+(direction, entry, TP, SL, R/R), then **tracks the position** and sends a
+follow-up **result** (realised P/L + R) when it resolves (TP / SL / trend-flip).
+
+You manage the whole watchlist **from Telegram** — add/remove/enable/disable
+coins — and auto-tune any coin with **`/analyze`**: the engine fetches that
+symbol's history, grid-searches its best parameters (in-sample/out-of-sample),
+saves them, and reports the result. It is an **advisory** service — it never
+places orders.
 
 > Unlike the backtest sandbox, your Hetzner host has normal internet access, so
-> the live feed uses **genuine Binance BTC/USDT** data via `ccxt`.
+> the live feed uses **genuine Binance** data (any symbol) via `ccxt`.
 
 ### What an alert looks like
 
@@ -134,24 +139,48 @@ The open position is persisted in the dedup volume, so the follow-up result is
 sent even if the container restarts between entry and exit. Exit resolution uses
 the same intrabar rules as the backtest (stop-before-target, gap-through at open).
 
-### Interactive Telegram commands
+### Telegram commands
 
-The bot also listens for commands (long-polling `getUpdates` in a background
-thread) and only answers the configured `TELEGRAM_CHAT_ID`. They appear in the
-Telegram "/" menu automatically:
+The bot listens for commands (long-polling `getUpdates` in a background thread),
+answers only the configured `TELEGRAM_CHAT_ID`, and registers a "/" menu.
 
-| Command | What it shows |
+**Manage the watchlist:**
+
+| Command | Action |
 |---|---|
-| `/status` | service uptime, last checked candle, current price, open position |
-| `/position` (`/pos`) | open position detail + **floating** P/L and R |
-| `/stats` | all closed trades: count, win rate, total/avg R, best/worst, exit breakdown |
-| `/history [n]` | last *n* closed trades (default 5, max 20) |
-| `/price` | latest price, RSI, ATR, EMAs and trend |
-| `/params` (`/config`) | the active strategy parameters |
+| `/list` | all coins with status, params summary, open position |
+| `/add SOL/USDT` | add a coin (default params, enabled) |
+| `/remove SOL` | remove a coin |
+| `/enable SOL` / `/disable SOL` | start / pause watching (params kept) |
+| `/analyze SOL/USDT` | fetch history, auto-tune params, save & report (background job) |
+
+**Query a coin** (symbol optional when only one is watched):
+
+| Command | Shows |
+|---|---|
+| `/status [SOL]` | overview, or one coin: last candle, price, open position |
+| `/position SOL` | open position + **floating** P/L and R |
+| `/stats SOL` | closed trades: count, win rate, total/avg R, best/worst, exit breakdown |
+| `/history SOL 10` | last *n* closed trades (default 5, max 20) |
+| `/price SOL` | latest price, RSI, ATR, EMAs and trend |
+| `/params SOL` | that coin's active parameters (and whether tuned) |
 | `/help` | command list |
 
-Closed trades are stored in the persisted state (`history`), so `/stats` and
-`/history` survive restarts.
+The watchlist, per-coin tuned params, open positions and trade history are all
+persisted in the state volume, so everything survives restarts.
+
+### What an `/analyze` reply looks like
+
+```
+🔬 تحلیل SOL/USDT — 4h  (بهینه‌شده)
+بازه: 2020-08-11 → 2025-06-18 (10500 کندل)
+
+⚙️ پارامترهای انتخابی:
+EMA 50/100 | RSI<75 | SL 1.5×ATR / TP 5.0×ATR
+
+📊 درون‌نمونه (انتخاب): بازده +90.3% | Sharpe 0.86 | برد 39% | معاملات 41
+🧪 برون‌نمونه (آزمون صادقانه): بازده +15.2% | Sharpe 0.62 | برد 33% | DD -12.4% | معاملات 15
+```
 
 ### Deploy on your Hetzner Docker host
 
@@ -162,22 +191,18 @@ docker compose up -d --build  # builds the image and starts the monitor
 docker compose logs -f        # watch it; you'll get a "bot activated" message
 ```
 
-Get a bot token from **@BotFather** and your chat id from **@userinfobot**.
+Get a bot token from **@BotFather** and your chat id from **@userinfobot**. Set
+the initial `WATCHLIST` in `.env`; afterwards manage coins live from Telegram.
 The service:
 - only makes **outbound** calls (Binance + Telegram) — no open ports needed;
 - `restart: unless-stopped`, so it survives reboots;
-- dedups via a Docker **volume** (`monitor-state`) so a restart won't re-alert
-  the same candle;
+- persists the watchlist / params / positions / history in a Docker **volume**
+  (`monitor-state`), so restarts never re-alert the same candle or lose tuning;
 - evaluates signals only on **closed** candles (same no-look-ahead rule as the
   backtest); poll cadence is `POLL_SECONDS` (default 5 min).
 
-All strategy knobs are env vars in `.env` (`EMA_FAST/EMA_SLOW`, `RSI_*`,
-`ATR_*_MULT`, `ALLOW_SHORT`, …) — **keep them identical to what you backtested.**
-
-One-shot manual check (no loop), e.g. for testing on the host:
-```bash
-docker compose run --rm btc-monitor python -m src.live.monitor --once
-```
+`.env` only sets the **seed/default** params for new coins — each coin's real
+parameters come from `/analyze`.
 
 ## Layout
 
@@ -187,13 +212,16 @@ src/strategy.py     EMA / RSI / ATR indicators + causal signal generation
 src/backtest.py     event-driven engine (next-bar fills, intrabar ATR exits, costs)
 src/metrics.py      return / Sharpe / Sortino / drawdown / win-rate / PF
 src/fetch_binance.py  OPTIONAL genuine Binance BTC/USDT loader (ccxt)
+src/analysis.py     shared IS/OOS grid-search (used by backtest + live /analyze)
 run_backtest.py     orchestration: IS/OOS split, grid search, reporting, plots
 
-src/live/feed.py      live recent-candle feed from Binance (ccxt), drops open bar
+src/live/feed.py      Binance feed (ccxt): fetch_recent + fetch_history (paged)
 src/live/notifier.py  Telegram Bot-API: send + getUpdates + setMyCommands
-src/live/commands.py  /status /position /stats /history /price /params handlers
-src/live/monitor.py   polling loop + command listener thread; alert -> track -> P/L
-Dockerfile            image for the live monitoring service
-docker-compose.yml    one-command deploy (volume for dedup state, auto-restart)
+src/live/state.py     persisted watchlist + per-symbol state, migration, ops
+src/live/analyzer.py  /analyze engine: fetch history -> auto-tune params
+src/live/commands.py  command handlers (manage watchlist + per-symbol queries)
+src/live/monitor.py   multi-symbol loop + command/analysis threads; alert->track->P/L
+Dockerfile            image for the live engine
+docker-compose.yml    one-command deploy (volume for state, auto-restart)
 .env.example          configuration template
 ```

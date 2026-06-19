@@ -14,12 +14,12 @@ Run:  python3 run_backtest.py
 """
 from __future__ import annotations
 
-import itertools
 import json
 import os
 
 import pandas as pd
 
+from src.analysis import evaluate, grid_search
 from src.backtest import Costs, run_backtest
 from src.data_prep import load_4h
 from src.metrics import compute_metrics, format_metrics
@@ -27,51 +27,6 @@ from src.strategy import Params
 
 SPLIT = "2023-01-01"   # data before -> in-sample, on/after -> out-of-sample
 OUTDIR = "results"
-
-
-def _ts(x):
-    t = pd.Timestamp(x)
-    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
-
-
-def evaluate(full_equity, all_trades, lo, hi):
-    """Slice the full-history equity/trades to [lo, hi) and rebase for metrics."""
-    lo, hi = _ts(lo), _ts(hi)
-    eq = full_equity.loc[lo:hi]
-    eq = eq / eq.iloc[0] * 10_000.0  # rebase to the standard starting cash
-    trades = [t for t in all_trades if lo <= t.entry_time < hi]
-    return compute_metrics(eq, trades)
-
-
-def run_one(df, p, costs):
-    res = run_backtest(df, p, costs)
-    return res
-
-
-def grid_search(df, costs, split):
-    """Optimise parameters on the in-sample window only (by Sharpe)."""
-    grid = {
-        "ema_fast": [20, 50],
-        "ema_slow": [100, 200],
-        "rsi_long_max": [65, 75],
-        "atr_sl_mult": [1.5, 2.5],
-        "atr_tp_mult": [3.0, 5.0],
-    }
-    keys = list(grid)
-    best = None
-    is_end = pd.Timestamp(split, tz="UTC")
-    for combo in itertools.product(*grid.values()):
-        kw = dict(zip(keys, combo))
-        p = Params(**kw)
-        res = run_backtest(df, p, costs)
-        is_m = evaluate(res.equity, res.trades, df.index[0], split)
-        # require a minimum trade count so we don't "win" on 2 lucky trades
-        if is_m["num_trades"] < 15:
-            continue
-        score = is_m["sharpe"]
-        if score == score and (best is None or score > best[0]):
-            best = (score, p, is_m, res)
-    return best
 
 
 def section(title):
@@ -112,9 +67,9 @@ def main():
         chosen = default_p
         res_best = res_def
     else:
-        score, chosen, is_m, res_best = best
+        chosen, is_m, _oos_m, res_best = best
         print(f"Best in-sample params: {chosen}")
-        print(f"In-sample Sharpe: {score:.2f}")
+        print(f"In-sample Sharpe: {is_m['sharpe']:.2f}")
 
     is_best = evaluate(res_best.equity, res_best.trades, df.index[0], SPLIT)
     oos_best = evaluate(res_best.equity, res_best.trades, SPLIT, df.index[-1])
