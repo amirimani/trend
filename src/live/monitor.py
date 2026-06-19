@@ -330,6 +330,27 @@ def verdict_note(verdict: str, symbol: str, enabled: bool) -> str:
     return "✅ اعتبارسنجی موفق بود — این پارامترها ذخیره و برای رصد استفاده می‌شود."
 
 
+def _params_summary(p: dict) -> str:
+    """Human-readable description of the ACTUAL chosen options."""
+    entry = ("بریک‌اوت دانچیان" if p.get("entry_mode") == "donchian"
+             else f"کراس EMA {p['ema_fast']}/{p['ema_slow']}")
+    em = p.get("exit_mode", "fixed")
+    if em == "trailing":
+        ex = f"تریلینگ‌استاپ `{p['trail_atr_mult']}×ATR` | SL `{p['atr_sl_mult']}×`"
+    elif em == "partial":
+        ex = (f"پلکانی @`{p['partial_tp_mult']}×`+تریل `{p['trail_atr_mult']}×` | "
+              f"SL `{p['atr_sl_mult']}×`")
+    else:
+        ex = f"TP `{p['atr_tp_mult']}×` / SL `{p['atr_sl_mult']}×ATR`"
+    filt = []
+    if p.get("use_rsi_filter", True):
+        filt.append(f"RSI<{p['rsi_long_max']:.0f}")
+    if p.get("regime_filter"):
+        filt.append("فیلتر روند")
+    filt_s = "، ".join(filt) if filt else "بدون فیلتر"
+    return (f"ورود: {entry}\nفیلتر: {filt_s}\nخروج: {ex}")
+
+
 def format_analysis(summary: dict, symbol: str, timeframe: str, footer: str = "") -> str:
     p = summary["params"]
     is_m, oos = summary["in_sample"], summary["out_sample"]
@@ -338,9 +359,7 @@ def format_analysis(summary: dict, symbol: str, timeframe: str, footer: str = ""
         f"🔬 *تحلیل {symbol}* — {timeframe}  ({tuned})\n"
         f"بازه: {summary['range'][0][:10]} → {summary['range'][1][:10]} "
         f"({summary['n_bars']} کندل)\n\n"
-        f"⚙️ پارامترهای انتخابی:\n"
-        f"EMA `{p['ema_fast']}/{p['ema_slow']}` | RSI<`{p['rsi_long_max']}` | "
-        f"SL `{p['atr_sl_mult']}×ATR` / TP `{p['atr_tp_mult']}×ATR`\n\n"
+        f"⚙️ *پارامترهای انتخابی:*\n{_params_summary(p)}\n\n"
         f"📊 *درون‌نمونه (انتخاب):* بازده `{is_m['total_return']*100:+.1f}%` | "
         f"Sharpe `{is_m['sharpe']:.2f}` | برد `{is_m['win_rate']*100:.0f}%` | "
         f"معاملات `{is_m['num_trades']}`\n"

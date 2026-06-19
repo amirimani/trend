@@ -46,24 +46,38 @@ def evaluate(full_equity: pd.Series, all_trades: list, lo, hi) -> dict:
 
 def grid_search(df: pd.DataFrame, costs: Costs, split, grid: dict | None = None,
                 min_trades: int = 15, base: Params | None = None):
-    """Select parameters by IN-SAMPLE Sharpe (with a minimum-trade guard).
+    """Select parameters robustly via IN-SAMPLE cross-validation.
 
-    Returns (best_Params, is_metrics, oos_metrics, full_result) or None.
+    The in-sample window is split into two contiguous halves; a config is scored
+    by the *minimum* of its Sharpe across the two halves (so it must work in
+    BOTH sub-periods, not just on aggregate). This fights the over-fitting that
+    a plain "best in-sample Sharpe" suffers — without ever touching the
+    out-of-sample data. Returns (best_Params, is_metrics, oos_metrics, result)
+    or None.
     """
     grid = grid or DEFAULT_GRID
     base = base or Params()
     keys = list(grid)
+
+    split_ts = _ts(split)
+    is_index = df.index[df.index < split_ts]
+    mid = is_index[len(is_index) // 2] if len(is_index) >= 4 else split
+
     best = None
     for combo in itertools.product(*grid.values()):
         kw = {**vars(base), **dict(zip(keys, combo))}
-        # Params only accepts its declared fields:
         p = Params(**{k: v for k, v in kw.items() if k in vars(Params())})
         res = run_backtest(df, p, costs)
         is_m = evaluate(res.equity, res.trades, df.index[0], split)
         if is_m["num_trades"] < min_trades:
             continue
-        score = is_m["sharpe"]
-        if score == score and (best is None or score > best[0]):
+        sh1 = evaluate(res.equity, res.trades, df.index[0], mid)["sharpe"]
+        sh2 = evaluate(res.equity, res.trades, mid, split)["sharpe"]
+        # A half with no/too-few trades can't be trusted -> treat as poor.
+        s1 = sh1 if sh1 == sh1 else -9.0
+        s2 = sh2 if sh2 == sh2 else -9.0
+        score = min(s1, s2)        # robust: worst sub-period must still be ok
+        if best is None or score > best[0]:
             oos_m = evaluate(res.equity, res.trades, split, df.index[-1])
             best = (score, p, is_m, oos_m, res)
     if best is None:
