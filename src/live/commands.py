@@ -17,6 +17,7 @@ from src.live import state as st
 MENU = [
     ("menu", "منوی دکمه‌ای (شیشه‌ای)"),
     ("list", "فهرست ارزها و وضعیت‌شان"),
+    ("compare", "مقایسهٔ ارزها بر اساس برون‌نمونه"),
     ("summary", "گزارش هفتگی عملکرد همهٔ ارزها"),
     ("status", "وضعیت کلی یا یک ارز: /status SOL"),
     ("position", "پوزیشن باز یک ارز: /position SOL"),
@@ -45,6 +46,7 @@ def _btn(text, data):
 def main_menu_kb(ctx) -> dict:
     wl = st.watchlist(ctx.state)
     rows = [[_btn("📋 لیست", "list"), _btn("📅 گزارش هفتگی", "summary")]]
+    rows.append([_btn("⚖️ مقایسهٔ ارزها", "compare")])
     row = []
     for s in wl:
         flag = "🟢" if wl[s].get("enabled") else "⚪️"
@@ -348,6 +350,50 @@ def cmd_analyze(ctx, arg=None):
     return ctx.start_analysis(arg)
 
 
+def cmd_compare(ctx, arg=None):
+    """Rank watched coins by their out-of-sample Sharpe to ease selection."""
+    wl = st.watchlist(ctx.state)
+    if not wl:
+        return "📭 واچ‌لیست خالی است. با `/add SOL/USDT` اضافه کن."
+    analyzed, pending = [], []
+    for sym, e in wl.items():
+        a = e.get("analysis")
+        if a and a.get("out_sample"):
+            analyzed.append((sym, e, a))
+        else:
+            pending.append(sym)
+
+    def _sh(item):
+        v = item[2]["out_sample"].get("sharpe")
+        return v if v == v else -1e9  # NaN last
+    analyzed.sort(key=_sh, reverse=True)
+
+    medals = ["🥇", "🥈", "🥉"]
+    vmark = {"good": "✅", "weak": "⚠️", "fail": "🛑"}
+    lines = []
+    for i, (sym, e, a) in enumerate(analyzed):
+        oos = a["out_sample"]
+        sh = oos.get("sharpe")
+        sh_s = f"{sh:.2f}" if sh == sh else "—"
+        rank = medals[i] if i < 3 else "•"
+        flag = "🟢" if e.get("enabled") else "⚪️"
+        lines.append(
+            f"{rank} `{sym}` {flag}{vmark.get(a.get('verdict'), '')} — "
+            f"Sharpe `{sh_s}` | بازده `{oos['total_return']*100:+.0f}%` | "
+            f"افت `{oos['max_drawdown']*100:.0f}%` | برد `{oos['win_rate']*100:.0f}%` | "
+            f"معاملات `{oos['num_trades']}`"
+        )
+    head = "📊 *مقایسهٔ واچ‌لیست* — بر اساس آزمون برون‌نمونه (OOS)\n\n"
+    body = "\n".join(lines) if lines else "هنوز هیچ ارزی تحلیل نشده."
+    foot = ""
+    if analyzed:
+        foot += f"\n\n🏆 بهترین ریسک‌به‌ریوارد: `{analyzed[0][0]}`"
+    if pending:
+        foot += "\n🔘 تحلیل‌نشده: " + "، ".join(f"`{s}`" for s in pending) + " — `/analyze` بزن"
+    foot += "\n_رتبه‌بندی بر اساس Sharpe برون‌نمونه است؛ تضمین آینده نیست._"
+    return head + body + foot
+
+
 def cmd_summary(ctx, arg=None):
     """On-demand weekly performance report (default 7 days; /summary 30 for 30d)."""
     from src.live import monitor  # lazy to avoid import cycle
@@ -387,7 +433,7 @@ def cmd_report(ctx, arg=None):
 # --------------------------------------------------------------------------- #
 _HANDLERS = {
     "help": cmd_help, "start": cmd_help, "menu": cmd_menu,
-    "list": cmd_list, "summary": cmd_summary,
+    "list": cmd_list, "summary": cmd_summary, "compare": cmd_compare,
     "status": cmd_status, "position": cmd_position, "pos": cmd_position,
     "stats": cmd_stats, "price": cmd_price, "params": cmd_params, "config": cmd_params,
     "add": cmd_add, "remove": cmd_remove, "delete": cmd_remove,
