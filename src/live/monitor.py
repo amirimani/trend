@@ -91,6 +91,9 @@ WEAK_OOS_SHARPE = _f("WEAK_OOS_SHARPE", 0.5)
 WEEKLY_REPORT = _b("WEEKLY_REPORT", True)
 REPORT_DAY = _i("REPORT_DAY", 0)
 REPORT_HOUR = _i("REPORT_HOUR", 9)
+# Periodic auto re-analysis: re-tune each coin whose params are older than this
+# many days (also tunes never-analysed coins). 0 disables. One coin per cycle.
+REANALYZE_DAYS = _i("REANALYZE_DAYS", 30)
 
 
 # --------------------------------------------------------------------------- #
@@ -106,17 +109,28 @@ class Context:
     runtime: dict = field(default_factory=lambda: {
         "started_at": datetime.now(timezone.utc).isoformat(), "symbols": {}})
     analyzing: set = field(default_factory=set)
+    backtesting: set = field(default_factory=set)
     # injected so tests can substitute local data
     fetch_recent_fn: callable = fetch_recent
     fetch_history_fn: callable = fetch_history
 
-    def start_analysis(self, symbol: str) -> str:
+    def start_analysis(self, symbol: str, auto: bool = False) -> str:
         symbol = st.normalize_symbol(symbol)
         if symbol in self.analyzing:
             return f"⏳ تحلیل `{symbol}` همین الان در حال اجراست."
         self.analyzing.add(symbol)
-        threading.Thread(target=_analysis_worker, args=(self, symbol), daemon=True).start()
+        threading.Thread(target=_analysis_worker, args=(self, symbol, auto), daemon=True).start()
         return f"🔬 تحلیل `{symbol}` شروع شد؛ نتیجه را به‌زودی می‌فرستم…"
+
+    def start_backtest(self, symbol: str) -> str:
+        symbol = st.normalize_symbol(symbol)
+        if symbol not in st.watchlist(self.state):
+            return f"`{symbol}` در واچ‌لیست نیست. اول `/add {symbol}` کن."
+        if symbol in self.backtesting:
+            return f"⏳ بک‌تست `{symbol}` در حال اجراست."
+        self.backtesting.add(symbol)
+        threading.Thread(target=_backtest_worker, args=(self, symbol), daemon=True).start()
+        return f"🧪 بک‌تست `{symbol}` شروع شد؛ نتیجه و نمودار به‌زودی می‌آید…"
 
 
 # --------------------------------------------------------------------------- #
@@ -373,7 +387,7 @@ def check_all(ctx: Context) -> None:
 # --------------------------------------------------------------------------- #
 # Background analysis worker
 # --------------------------------------------------------------------------- #
-def _analysis_worker(ctx: Context, symbol: str) -> None:
+def _analysis_worker(ctx: Context, symbol: str, auto: bool = False) -> None:
     try:
         summary = run_analysis(symbol, ctx.fetch_history_fn, ctx.timeframe, ANALYZE_SINCE)
         verdict = quality_verdict(summary["out_sample"])
@@ -393,14 +407,115 @@ def _analysis_worker(ctx: Context, symbol: str) -> None:
             enabled = wl[symbol]["enabled"]
             st.save_state(ctx.state)
         footer = verdict_note(verdict, symbol, enabled)
-        ctx.notifier.send(format_analysis(summary, symbol, ctx.timeframe, footer))
-        log.info("Analysis done for %s (tuned=%s, verdict=%s).",
-                 symbol, summary["tuned"], verdict)
+        prefix = "🔄 *بازتحلیل خودکار*\n" if auto else ""
+        ctx.notifier.send(prefix + format_analysis(summary, symbol, ctx.timeframe, footer))
+        log.info("Analysis done for %s (auto=%s, tuned=%s, verdict=%s).",
+                 symbol, auto, summary["tuned"], verdict)
     except Exception as e:
         log.exception("Analysis failed for %s: %s", symbol, e)
-        ctx.notifier.send(f"❌ تحلیل `{symbol}` ناموفق بود: {e}")
+        if not auto:
+            ctx.notifier.send(f"❌ تحلیل `{symbol}` ناموفق بود: {e}")
     finally:
         ctx.analyzing.discard(symbol)
+
+
+def maybe_reanalyze(ctx: Context) -> None:
+    """Re-tune the single most-overdue enabled coin (one per cycle to stay gentle)."""
+    if REANALYZE_DAYS <= 0:
+        return
+    now = datetime.now(timezone.utc)
+    target = None
+    with ctx.lock:
+        due = []
+        for s, e in st.watchlist(ctx.state).items():
+            if not e.get("enabled") or s in ctx.analyzing:
+                continue
+            at = e.get("analyzed_at")
+            age = (now - pd.Timestamp(at)).days if at else 10 ** 6
+            if age >= REANALYZE_DAYS:
+                due.append((age, s))
+        if due:
+            due.sort(reverse=True)
+            target = due[0][1]
+            ctx.analyzing.add(target)  # reserve before spawning
+    if target:
+        log.info("Auto re-analysis triggered for %s.", target)
+        threading.Thread(target=_analysis_worker, args=(ctx, target, True), daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
+# On-demand backtest (/backtest) — runs current params over full history
+# --------------------------------------------------------------------------- #
+def _plot_equity(symbol: str, res, timeframe: str) -> str | None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    import tempfile
+
+    eq, bnh = res.equity, res.bnh_equity
+    fig, ax = plt.subplots(2, 1, figsize=(11, 7), gridspec_kw={"height_ratios": [3, 1]})
+    ax[0].plot(eq.index, eq.values, label="Strategy", lw=1.3)
+    if bnh is not None:
+        ax[0].plot(bnh.index, bnh.values, label="Buy & Hold", lw=1.0, alpha=0.7)
+    ax[0].set_yscale("log")
+    ax[0].set_title(f"{symbol} {timeframe} — backtest equity (log)")
+    ax[0].legend(); ax[0].grid(alpha=0.3)
+    dd = eq / eq.cummax() - 1.0
+    ax[1].fill_between(dd.index, dd.values * 100, 0, color="red", alpha=0.4)
+    ax[1].set_title("Drawdown (%)"); ax[1].grid(alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(tempfile.gettempdir(), f"bt_{symbol.replace('/', '')}.png")
+    fig.savefig(path, dpi=110); plt.close(fig)
+    return path
+
+
+def _backtest_caption(symbol, p, m, bnh, df, timeframe) -> str:
+    return (
+        f"🧪 *بک‌تست {symbol}* — {timeframe}\n"
+        f"بازه: {str(df.index[0])[:10]} → {str(df.index[-1])[:10]} ({len(df)} کندل)\n"
+        f"پارامتر: EMA `{p.ema_fast}/{p.ema_slow}` | SL `{p.atr_sl_mult}×` / TP `{p.atr_tp_mult}×`\n\n"
+        f"بازده کل: `{m['total_return']*100:+.1f}%` | CAGR `{m['cagr']*100:+.1f}%`\n"
+        f"Sharpe `{m['sharpe']:.2f}` | حداکثر افت `{m['max_drawdown']*100:.1f}%`\n"
+        f"برد `{m['win_rate']*100:.0f}%` | معاملات `{m['num_trades']}` | "
+        f"Profit Factor `{m['profit_factor']:.2f}`\n"
+        f"📉 خرید-و-نگه‌داری: بازده `{bnh['total_return']*100:+.1f}%` | "
+        f"افت `{bnh['max_drawdown']*100:.1f}%`\n"
+        f"_شامل کارمزد ۰.۱٪ و slippage ۰.۰۵٪ هر طرف._"
+    )
+
+
+def _backtest_worker(ctx: Context, symbol: str) -> None:
+    from src.backtest import Costs, run_backtest
+    from src.metrics import compute_metrics
+    try:
+        with ctx.lock:
+            e = st.watchlist(ctx.state).get(symbol)
+            p = st.dict_to_params(e["params"]) if e else ctx.default_params
+        df = ctx.fetch_history_fn(symbol, ctx.timeframe, ANALYZE_SINCE)
+        if df is None or len(df) < 250:
+            raise ValueError("دادهٔ کافی نیست")
+        res = run_backtest(df, p, Costs())
+        m = compute_metrics(res.equity, res.trades)
+        bnh = compute_metrics(res.bnh_equity, [])
+        caption = _backtest_caption(symbol, p, m, bnh, df, ctx.timeframe)
+        png = _plot_equity(symbol, res, ctx.timeframe)
+        if png:
+            ctx.notifier.send_photo(png, caption)
+            try:
+                os.remove(png)
+            except OSError:
+                pass
+        else:
+            ctx.notifier.send(caption)
+        log.info("Backtest done for %s.", symbol)
+    except Exception as e:
+        log.exception("Backtest failed for %s: %s", symbol, e)
+        ctx.notifier.send(f"❌ بک‌تست `{symbol}` ناموفق بود: {e}")
+    finally:
+        ctx.backtesting.discard(symbol)
 
 
 # --------------------------------------------------------------------------- #
@@ -502,6 +617,18 @@ def command_loop(ctx: Context) -> None:
         try:
             for u in ctx.notifier.get_updates(offset=offset, timeout=25):
                 offset = u["update_id"] + 1
+                cq = u.get("callback_query")
+                if cq:  # a glass (inline) button was tapped
+                    chat = cq.get("message", {}).get("chat", {}).get("id")
+                    ctx.notifier.answer_callback(cq.get("id", ""))
+                    if str(chat) != str(ctx.notifier.chat_id):
+                        continue
+                    data = (cq.get("data") or "").strip()
+                    if data:
+                        with ctx.lock:
+                            reply = commands.dispatch("/" + data, ctx)
+                        _send_reply(ctx, reply)
+                    continue
                 msg = u.get("message") or u.get("edited_message") or {}
                 if str(msg.get("chat", {}).get("id")) != str(ctx.notifier.chat_id):
                     continue
@@ -510,11 +637,20 @@ def command_loop(ctx: Context) -> None:
                     continue
                 with ctx.lock:  # serialise command handling vs the market/analysis threads
                     reply = commands.dispatch(text, ctx)
-                if reply:
-                    ctx.notifier.send(reply)
+                _send_reply(ctx, reply)
         except Exception as e:
             log.exception("Command loop error: %s", e)
             time.sleep(5)
+
+
+def _send_reply(ctx: Context, reply) -> None:
+    """A handler reply may be plain text or {'text':..., 'keyboard':...}."""
+    if not reply:
+        return
+    if isinstance(reply, dict):
+        ctx.notifier.send(reply.get("text", ""), reply_markup=reply.get("keyboard"))
+    else:
+        ctx.notifier.send(reply)
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +666,7 @@ def build_context() -> Context:
 
 
 def main():
+    from src.live import commands
     ctx = build_context()
     symbols = list(st.watchlist(ctx.state))
     log.info("Live monitor: watching %s | poll=%ss", symbols, POLL_SECONDS)
@@ -537,13 +674,16 @@ def main():
         "🤖 *موتور رصد چندارزی فعال شد*\n"
         f"واچ‌لیست: {', '.join(f'`{s}`' for s in symbols) or '—'}\n"
         f"تایم‌فریم: {TIMEFRAME} | بازهٔ بررسی: هر {POLL_SECONDS//60} دقیقه\n"
-        f"برای فهرست دستورها /help را بفرست."
+        f"بازتحلیل خودکار: هر {REANALYZE_DAYS} روز\n"
+        f"یک گزینه را انتخاب کن یا /help را بفرست:",
+        reply_markup=commands.main_menu_kb(ctx),
     )
     threading.Thread(target=command_loop, args=(ctx,), daemon=True).start()
     while True:
         try:
             check_all(ctx)
             maybe_send_weekly(ctx)
+            maybe_reanalyze(ctx)
         except Exception as e:
             log.exception("Cycle error: %s", e)
         time.sleep(POLL_SECONDS)

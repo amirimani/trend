@@ -164,7 +164,21 @@ answers only the configured `TELEGRAM_CHAT_ID`, and registers a "/" menu.
 | `/history SOL 10` | last *n* closed trades (default 5, max 20) |
 | `/price SOL` | latest price, RSI, ATR, EMAs and trend |
 | `/params SOL` | that coin's active parameters (and whether tuned) |
+| `/backtest SOL` | full backtest with current params → metrics + **equity-curve chart** |
+| `/report SOL` | re-show the stored `/analyze` result (IS/OOS + verdict) |
+| `/summary [days]` | weekly performance report (default 7d) |
+| `/menu` | **glass (inline-button) menu** — tap to navigate, no typing |
 | `/help` | command list |
+
+**Glass-button menu:** `/menu` (and `/help`, and the startup message) sends an
+inline keyboard. The main menu has 📋 list / 📅 weekly / one button per coin;
+tapping a coin opens its submenu (price, stats, position, history, analyze,
+backtest, enable/disable) — all driven by callback buttons, no commands to type.
+
+**Periodic auto-tuning:** every `REANALYZE_DAYS` (default 30) the engine
+automatically re-runs `/analyze` on the most-overdue coin (one per cycle), so
+parameters stay fresh as the market regime changes; brand-new coins are tuned
+automatically too. Each auto-tune posts its result (with the OOS quality guard).
 
 The watchlist, per-coin tuned params, open positions and trade history are all
 persisted in the state volume, so everything survives restarts.

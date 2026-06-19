@@ -1,6 +1,7 @@
 """Telegram notifier — sends messages via the Bot API (plain HTTP, no SDK)."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -22,21 +23,20 @@ class TelegramNotifier:
     def _api(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.token}/{method}"
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, reply_markup: dict | None = None) -> bool:
         if not self.enabled:
             print("[TELEGRAM-DRYRUN]\n" + text + "\n")
             return False
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         try:
-            r = requests.post(
-                self._api("sendMessage"),
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True,
-                },
-                timeout=self.timeout,
-            )
+            r = requests.post(self._api("sendMessage"), json=payload, timeout=self.timeout)
             if r.status_code != 200:
                 log.error("Telegram send failed %s: %s", r.status_code, r.text[:300])
                 return False
@@ -44,6 +44,34 @@ class TelegramNotifier:
         except requests.RequestException as e:
             log.error("Telegram send error: %s", e)
             return False
+
+    def send_photo(self, path: str, caption: str = "", reply_markup: dict | None = None) -> bool:
+        if not self.enabled:
+            print(f"[TELEGRAM-DRYRUN photo {path}]\n{caption}\n")
+            return False
+        data = {"chat_id": self.chat_id, "caption": caption[:1024], "parse_mode": "Markdown"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        try:
+            with open(path, "rb") as fh:
+                r = requests.post(self._api("sendPhoto"), data=data,
+                                  files={"photo": fh}, timeout=self.timeout + 30)
+            if r.status_code != 200:
+                log.error("sendPhoto failed %s: %s", r.status_code, r.text[:200])
+            return r.status_code == 200
+        except (requests.RequestException, OSError) as e:
+            log.error("sendPhoto error: %s", e)
+            return False
+
+    def answer_callback(self, callback_id: str, text: str = "") -> None:
+        if not self.enabled:
+            return
+        try:
+            requests.post(self._api("answerCallbackQuery"),
+                          json={"callback_query_id": callback_id, "text": text},
+                          timeout=self.timeout)
+        except requests.RequestException as e:
+            log.error("answerCallbackQuery error: %s", e)
 
     def get_updates(self, offset=None, timeout: int = 25) -> list[dict]:
         """Long-poll for incoming updates (commands). Returns the result list."""

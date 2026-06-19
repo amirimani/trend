@@ -15,6 +15,7 @@ import pandas as pd
 from src.live import state as st
 
 MENU = [
+    ("menu", "منوی دکمه‌ای (شیشه‌ای)"),
     ("list", "فهرست ارزها و وضعیت‌شان"),
     ("summary", "گزارش هفتگی عملکرد همهٔ ارزها"),
     ("status", "وضعیت کلی یا یک ارز: /status SOL"),
@@ -24,6 +25,7 @@ MENU = [
     ("price", "قیمت و اندیکاتورها: /price SOL"),
     ("params", "پارامترهای یک ارز: /params SOL"),
     ("analyze", "بهینه‌سازی پارامترهای یک ارز: /analyze SOL"),
+    ("backtest", "بک‌تست و نمودار یک ارز: /backtest SOL"),
     ("report", "نمایش دوبارهٔ نتیجهٔ تحلیل ذخیره‌شده: /report SOL"),
     ("add", "افزودن ارز: /add SOL/USDT"),
     ("remove", "حذف ارز: /remove SOL"),
@@ -31,6 +33,39 @@ MENU = [
     ("disable", "غیرفعال‌سازی ارز: /disable SOL"),
     ("help", "راهنمای دستورها"),
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Glass (inline) keyboards
+# --------------------------------------------------------------------------- #
+def _btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def main_menu_kb(ctx) -> dict:
+    wl = st.watchlist(ctx.state)
+    rows = [[_btn("📋 لیست", "list"), _btn("📅 گزارش هفتگی", "summary")]]
+    row = []
+    for s in wl:
+        flag = "🟢" if wl[s].get("enabled") else "⚪️"
+        row.append(_btn(f"{flag} {s.split('/')[0]}", f"menu {s}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn("❓ راهنما", "help")])
+    return {"inline_keyboard": rows}
+
+
+def symbol_kb(sym: str) -> dict:
+    return {"inline_keyboard": [
+        [_btn("📈 قیمت", f"price {sym}"), _btn("📊 آمار", f"stats {sym}")],
+        [_btn("📌 پوزیشن", f"position {sym}"), _btn("🗒 تاریخچه", f"history {sym}")],
+        [_btn("🔬 تحلیل", f"analyze {sym}"), _btn("🧪 بک‌تست", f"backtest {sym}")],
+        [_btn("📄 گزارش تحلیل", f"report {sym}")],
+        [_btn("✅ فعال", f"enable {sym}"), _btn("⛔ غیرفعال", f"disable {sym}")],
+        [_btn("⬅️ منوی اصلی", "menu")],
+    ]}
 
 
 # --------------------------------------------------------------------------- #
@@ -112,7 +147,25 @@ def _stats_of(hist):
 # query commands
 # --------------------------------------------------------------------------- #
 def cmd_help(ctx, arg=None):
-    return "📖 *دستورهای موجود*\n" + "\n".join(f"/{c} — {d}" for c, d in MENU)
+    text = "📖 *دستورهای موجود*\n" + "\n".join(f"/{c} — {d}" for c, d in MENU)
+    return {"text": text, "keyboard": main_menu_kb(ctx)}
+
+
+def cmd_menu(ctx, arg=None):
+    """Glass-button menu. With a symbol -> that coin's submenu; else main menu."""
+    if arg:
+        sym = _resolve_symbol(ctx, arg)
+        if sym not in st.watchlist(ctx.state):
+            return f"`{sym}` در واچ‌لیست نیست."
+        return {"text": cmd_status(ctx, sym), "keyboard": symbol_kb(sym)}
+    return {"text": "🔹 *منوی اصلی* — یک گزینه را انتخاب کن:",
+            "keyboard": main_menu_kb(ctx)}
+
+
+def cmd_backtest(ctx, arg=None):
+    if not arg:
+        return "نماد را بده: مثلا `/backtest SOL/USDT`"
+    return ctx.start_backtest(arg)
 
 
 def cmd_list(ctx, arg=None):
@@ -333,12 +386,13 @@ def cmd_report(ctx, arg=None):
 # dispatch
 # --------------------------------------------------------------------------- #
 _HANDLERS = {
-    "help": cmd_help, "start": cmd_help, "list": cmd_list, "summary": cmd_summary,
+    "help": cmd_help, "start": cmd_help, "menu": cmd_menu,
+    "list": cmd_list, "summary": cmd_summary,
     "status": cmd_status, "position": cmd_position, "pos": cmd_position,
     "stats": cmd_stats, "price": cmd_price, "params": cmd_params, "config": cmd_params,
     "add": cmd_add, "remove": cmd_remove, "delete": cmd_remove,
     "enable": cmd_enable, "disable": cmd_disable, "analyze": cmd_analyze,
-    "report": cmd_report,
+    "backtest": cmd_backtest, "report": cmd_report,
 }
 
 
