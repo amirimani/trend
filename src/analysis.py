@@ -24,6 +24,7 @@ DEFAULT_GRID = {
     "use_rsi_filter": [True, False],
     "exit_mode": ["fixed", "trailing", "partial"],
     "regime_filter": [False, True],
+    "htf_filter": [False, True],
     "atr_sl_mult": [1.5, 2.5],
 }
 

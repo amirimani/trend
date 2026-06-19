@@ -9,8 +9,11 @@ in-sample / out-of-sample split.
 - **Entry:** EMA fast/slow cross (default 50 / 200) **or** Donchian breakout
   (`entry_mode`). Long-only by default; shorts via `allow_short=True`.
 - **Entry filter (optional):** RSI(14) band (`use_rsi_filter`, default
-  `50 ≤ RSI < 70`) to avoid buying into an overbought market, plus an optional
-  **trend-regime filter** (`regime_filter`: only long above a long EMA).
+  `50 ≤ RSI < 70`); an optional **trend-regime filter** (`regime_filter`: only
+  long above a long EMA); and an optional **higher-timeframe (MTF) trend filter**
+  (`htf_filter`): take the trend from a higher timeframe (e.g. daily) and only
+  allow entries that agree with it, while entries still trigger on the base
+  timeframe. The HTF trend is computed causally (only completed HTF bars).
 - **Exit (`exit_mode`):**
   - `fixed` — ATR stop-loss + fixed ATR take-profit (default `SL 2·ATR`, `TP 4·ATR`).
   - `trailing` — ATR stop, no fixed target; a chandelier trailing stop lets

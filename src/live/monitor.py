@@ -348,6 +348,8 @@ def _params_summary(p: dict) -> str:
         filt.append(f"RSI<{p['rsi_long_max']:.0f}")
     if p.get("regime_filter"):
         filt.append("فیلتر روند")
+    if p.get("htf_filter"):
+        filt.append(f"روندِ تایم‌بالاتر ({p.get('htf') or 'خودکار'})")
     filt_s = "، ".join(filt) if filt else "بدون فیلتر"
     return (f"ورود: {entry}\nفیلتر: {filt_s}\nخروج: {ex}")
 

@@ -38,6 +38,13 @@ class Params:
     regime_filter: bool = False     # only go long above (short below) a long MA
     regime_ema: int = 200
 
+    # ---- Higher-timeframe (MTF) trend filter -------------------------------
+    # Take the TREND from a higher timeframe and only allow entries that agree
+    # with it (entries still trigger on this — the lower — timeframe).
+    htf_filter: bool = False
+    htf: str = ""                   # e.g. "1D"/"1W"; "" -> auto (one step up)
+    htf_ema: int = 50               # HTF trend = close vs EMA(htf_ema) on the HTF
+
     # ---- Exit options ------------------------------------------------------
     exit_mode: str = "fixed"        # "fixed" | "trailing" | "partial"
     trail_atr_mult: float = 3.0     # trailing-stop distance (trailing/partial)
@@ -93,6 +100,54 @@ def add_indicators(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     return out
 
 
+def _base_hours(idx: pd.DatetimeIndex) -> float:
+    if len(idx) < 3:
+        return 4.0
+    return float(pd.Series(idx).diff().median().total_seconds() / 3600.0)
+
+
+def _default_htf(base_hours: float) -> str:
+    if base_hours < 24:
+        return "1D"
+    if base_hours < 168:
+        return "1W"
+    return "1MS"
+
+
+def _rule_hours(rule: str) -> float:
+    """Approximate hours per bar for a pandas resample rule (1D/1W/1MS/4H...)."""
+    r = rule.upper()
+    num = int("".join(c for c in r if c.isdigit()) or 1)
+    if "MS" in r or r.endswith("M"):
+        return num * 24 * 30.0
+    if r.endswith("W"):
+        return num * 24 * 7.0
+    if r.endswith("D"):
+        return num * 24.0
+    if r.endswith("H"):
+        return float(num)
+    return 24.0
+
+
+def _htf_trend(df: pd.DataFrame, p: Params):
+    """Causal higher-timeframe trend (close > EMA) aligned to `df.index`.
+
+    Resamples to the higher timeframe, computes the trend on HTF closes, then
+    uses only the PREVIOUS completed HTF bar (shift(1)) before forward-filling
+    onto the base bars — so a base bar never sees an unfinished HTF bar.
+    Returns (trend_up_series, warmup_in_base_bars).
+    """
+    base_h = _base_hours(df.index)
+    rule = p.htf or _default_htf(base_h)
+    htf_close = df["close"].resample(rule).last().dropna()
+    htf_ema = htf_close.ewm(span=p.htf_ema, adjust=False).mean()
+    up_htf = (htf_close > htf_ema).shift(1)            # only completed HTF bars
+    up = up_htf.reindex(df.index, method="ffill").fillna(False).astype(bool)
+    ratio = max(1.0, _rule_hours(rule) / base_h)       # base bars per HTF bar
+    warmup = int(p.htf_ema * 3 * ratio)                # let the HTF EMA settle
+    return up, warmup
+
+
 def generate_signals(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     """
     Produce per-bar entry/exit *intentions* evaluated on closed bars.
@@ -138,6 +193,14 @@ def generate_signals(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     else:
         regime_long = regime_short = pd.Series(True, index=out.index)
 
+    # Higher-timeframe (MTF) trend filter (optional): align entries with the
+    # trend on a higher timeframe. Causal — uses only completed HTF bars.
+    htf_warmup = 0
+    if p.htf_filter:
+        up, htf_warmup = _htf_trend(out, p)
+        regime_long = regime_long & up
+        regime_short = regime_short & (~up)
+
     out["long_entry"] = long_raw & rsi_ok_long & regime_long
     out["long_exit"] = long_flip
 
@@ -151,7 +214,7 @@ def generate_signals(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     # Indicators are undefined until the slow EMA / ATR / channel warm up;
     # suppress signals there so we never trade on half-formed indicators.
     warmup = max(p.ema_slow, p.atr_period, p.rsi_period, p.donchian_period,
-                 p.regime_ema if p.regime_filter else 0)
+                 p.regime_ema if p.regime_filter else 0, htf_warmup)
     out.iloc[:warmup, out.columns.get_indexer(
         ["long_entry", "long_exit", "short_entry", "short_exit"]
     )] = False
