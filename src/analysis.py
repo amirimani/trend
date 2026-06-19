@@ -8,6 +8,7 @@ Kept inside the package so it ships in the Docker image (the Dockerfile copies
 from __future__ import annotations
 
 import itertools
+import math
 
 import pandas as pd
 
@@ -23,8 +24,7 @@ DEFAULT_GRID = {
     "ema_slow": [100, 200],
     "use_rsi_filter": [True, False],
     "exit_mode": ["fixed", "trailing", "partial"],
-    "regime_filter": [False, True],
-    "htf_filter": [False, True],
+    "htf_filter": [False, True],   # HTF trend gate (regime_filter dropped: redundant)
     "atr_sl_mult": [1.5, 2.5],
 }
 
@@ -60,39 +60,54 @@ def evaluate(full_equity: pd.Series, all_trades: list, lo, hi,
 
 
 def grid_search(df: pd.DataFrame, costs: Costs, split, grid: dict | None = None,
-                min_trades: int = 15, base: Params | None = None,
-                ppy: float = BARS_PER_YEAR):
-    """Select parameters robustly via IN-SAMPLE cross-validation.
+                min_trades: int = 20, base: Params | None = None,
+                ppy: float = BARS_PER_YEAR, half_min: int = 6):
+    """Select parameters with strict anti-over-fitting gates (no OOS leakage).
 
-    The in-sample window is split into two contiguous halves; a config is scored
-    by the *minimum* of its Sharpe across the two halves (so it must work in
-    BOTH sub-periods, not just on aggregate). This fights the over-fitting that
-    a plain "best in-sample Sharpe" suffers — without ever touching the
-    out-of-sample data. Returns (best_Params, is_metrics, oos_metrics, result)
-    or None.
+    The in-sample window is split into two contiguous halves; a config is kept
+    only if it:
+      * trades enough overall (`min_trades`) AND in each half (`half_min`);
+      * is profitable (positive Sharpe AND positive return) in BOTH halves
+        (consistency gate); and
+      * clears a sample-size- & trials-deflated Sharpe hurdle:
+            score = min(half Sharpes) - 0.5*sqrt(ln(#combos)) / sqrt(#trades)
+        which must be > 0 (so a config "found" among many trials on few trades
+        is penalised the way a Deflated Sharpe Ratio would penalise it).
+    If nothing clears the bar, returns None (caller falls back to defaults
+    rather than shipping an over-fit config).
     """
     grid = grid or DEFAULT_GRID
     base = base or Params()
     keys = list(grid)
+    combos = list(itertools.product(*grid.values()))
+    trials_penalty = 0.5 * math.sqrt(math.log(max(2, len(combos))))
 
     split_ts = _ts(split)
     is_index = df.index[df.index < split_ts]
     mid = is_index[len(is_index) // 2] if len(is_index) >= 4 else split
 
     best = None
-    for combo in itertools.product(*grid.values()):
+    for combo in combos:
         kw = {**vars(base), **dict(zip(keys, combo))}
         p = Params(**{k: v for k, v in kw.items() if k in vars(Params())})
         res = run_backtest(df, p, costs)
         is_m = evaluate(res.equity, res.trades, df.index[0], split, ppy)
-        if is_m["num_trades"] < min_trades:
+        nt = is_m["num_trades"]
+        if nt < min_trades:
             continue
-        sh1 = evaluate(res.equity, res.trades, df.index[0], mid, ppy)["sharpe"]
-        sh2 = evaluate(res.equity, res.trades, mid, split, ppy)["sharpe"]
-        # A half with no/too-few trades can't be trusted -> treat as poor.
-        s1 = sh1 if sh1 == sh1 else -9.0
-        s2 = sh2 if sh2 == sh2 else -9.0
-        score = min(s1, s2)        # robust: worst sub-period must still be ok
+        m1 = evaluate(res.equity, res.trades, df.index[0], mid, ppy)
+        m2 = evaluate(res.equity, res.trades, mid, split, ppy)
+        if m1["num_trades"] < half_min or m2["num_trades"] < half_min:
+            continue
+        sh1, sh2 = m1["sharpe"], m2["sharpe"]
+        if not (sh1 == sh1 and sh2 == sh2):
+            continue
+        # Consistency gate: must be profitable in BOTH in-sample halves.
+        if sh1 <= 0 or sh2 <= 0 or m1["total_return"] <= 0 or m2["total_return"] <= 0:
+            continue
+        score = min(sh1, sh2) - trials_penalty / math.sqrt(nt)   # deflated hurdle
+        if score <= 0:                                           # didn't clear it
+            continue
         if best is None or score > best[0]:
             oos_m = evaluate(res.equity, res.trades, split, df.index[-1], ppy)
             best = (score, p, is_m, oos_m, res)
@@ -117,13 +132,16 @@ def analyze_symbol(df: pd.DataFrame, costs: Costs | None = None,
     base = base or Params()
     ppy = periods_per_year(timeframe)
     grid = grid or grid_for(timeframe, allow_short=base.allow_short)
-    # Higher timeframes have fewer bars -> fewer signals; relax the trade floor.
-    min_trades = 8 if timeframe_hours(timeframe) >= 24 else 15
+    # Trade floors: enough samples to trust the stats (anti-over-fit). Daily has
+    # fewer bars, but we still demand a meaningful sample or we fall back.
+    daily = timeframe_hours(timeframe) >= 24
+    min_trades = 12 if daily else 20
+    half_min = 4 if daily else 6
     split_i = int(len(df) * split_frac)
     split = df.index[split_i]
 
     found = grid_search(df, costs, split, grid=grid, ppy=ppy,
-                        min_trades=min_trades, base=base)
+                        min_trades=min_trades, half_min=half_min, base=base)
     if found is None:
         # Fall back to the base settings if nothing cleared the trade threshold.
         p = base
