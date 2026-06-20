@@ -6,6 +6,22 @@ in-sample / out-of-sample split.
 
 ## Strategy
 
+Two families (`STRATEGY` / `Params.strategy`):
+
+- **`hold` — buy & hold with a bear filter (recommended).** Stay long while
+  price is above a long MA (`REGIME_EMA`, e.g. 100–200), move to **cash** when it
+  drops below, re-enter when it recovers. Aims for ~buy&hold returns with far
+  lower drawdown by sitting out bear markets. On BTC 2018–2025 this turned
+  buy&hold's +675% / −81% maxDD into roughly **+2200% / −45% maxDD**, and it
+  passes the out-of-sample check (OOS Sharpe ≈ 1.4–1.7). Note: in a *pure* bull
+  market it can lag plain buy&hold — its edge is dodging bear-market crashes
+  over a full cycle.
+- **`trend` — the EMA/RSI/ATR signal system below.** Rigorous and honest, but on
+  these coins it showed no reliable out-of-sample edge (the OOS guard disables
+  what doesn't validate).
+
+### `trend` details
+
 - **Entry:** EMA fast/slow cross (default 50 / 200) **or** Donchian breakout
   (`entry_mode`). Long-only by default; shorts via `allow_short=True`.
 - **Entry filter (optional):** RSI(14) band (`use_rsi_filter`, default
