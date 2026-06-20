@@ -79,6 +79,8 @@ def load_params() -> Params:
         atr_tp_mult=_f("ATR_TP_MULT", 4.0),
         allow_short=_b("ALLOW_SHORT", False),
         leverage=_f("LEVERAGE", 1.0),
+        strategy=os.getenv("STRATEGY", "trend").strip().lower(),
+        regime_ema=_i("REGIME_EMA", 200),
     )
 
 
@@ -363,6 +365,12 @@ def verdict_note(verdict: str, symbol: str, enabled: bool) -> str:
 
 def _params_summary(p: dict) -> str:
     """Human-readable description of the ACTUAL chosen options."""
+    if p.get("strategy") == "hold":
+        lev = p.get("leverage", 1.0)
+        lv = f" | اهرم {lev:g}x" if lev and lev != 1.0 else ""
+        return (f"استراتژی: نگه‌داری + فیلتر خرسی\n"
+                f"در بازار می‌مانی تا قیمت بالای EMA{p.get('regime_ema', 200)} است؛ "
+                f"زیر آن به نقد می‌روی.{lv}")
     entry = ("بریک‌اوت دانچیان" if p.get("entry_mode") == "donchian"
              else f"کراس EMA {p['ema_fast']}/{p['ema_slow']}")
     em = p.get("exit_mode", "fixed")

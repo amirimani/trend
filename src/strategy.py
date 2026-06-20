@@ -30,6 +30,13 @@ class Params:
     allow_short: bool = False  # spot BTC: long-only by default; futures: enable
     leverage: float = 1.0      # futures leverage (1 = spot/no leverage)
 
+    # ---- Strategy family ---------------------------------------------------
+    # "trend" : the EMA/RSI/ATR signal system (default).
+    # "hold"  : buy & hold with a bear filter — stay long while price is above a
+    #           long MA, move to cash when it drops below (re-enter when it
+    #           recovers). Aims for ~buy&hold returns with far lower drawdown.
+    strategy: str = "trend"
+
     # ---- Entry options -----------------------------------------------------
     entry_mode: str = "ema_cross"   # "ema_cross" | "donchian"
     donchian_period: int = 20       # breakout lookback for donchian entries
@@ -163,6 +170,21 @@ def generate_signals(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     only on closed bars t and t-1.
     """
     out = add_indicators(df, p)
+
+    # ---- "hold" strategy: buy & hold with a bear filter --------------------
+    if getattr(p, "strategy", "trend") == "hold":
+        rema = ema(out["close"], p.regime_ema)
+        bull = out["close"] > rema
+        prev = bull.shift(1, fill_value=False)
+        out["long_entry"] = bull & ~prev          # cash -> long when trend turns up
+        out["long_exit"] = (~bull) & prev         # long -> cash when trend turns down
+        out["short_entry"] = False
+        out["short_exit"] = False
+        warmup = p.regime_ema
+        out.iloc[:warmup, out.columns.get_indexer(
+            ["long_entry", "long_exit", "short_entry", "short_exit"])] = False
+        return out
+
     fast, slow = out["ema_fast"], out["ema_slow"]
 
     above = fast > slow

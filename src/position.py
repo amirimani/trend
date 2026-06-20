@@ -39,6 +39,17 @@ def open_position(side: int, entry: float, atr: float, p: Params,
     backtest/live can model getting liquidated before the stop when leverage is
     high relative to the stop distance.
     """
+    # "hold" strategy (or exit_mode "signal") exits ONLY on the opposite signal:
+    # no ATR stop / target / trailing / liquidation.
+    signal_only = getattr(p, "strategy", "trend") == "hold" or p.exit_mode == "signal"
+    if signal_only:
+        return {
+            "side": int(side), "entry": float(entry), "atr": float(atr),
+            "remaining": 1.0, "anchor": float(entry), "mode": "signal",
+            "trailing_engaged": False, "partial_done": True,
+            "stop": None, "tp": None, "t1": None, "liq": None,
+        }
+
     pos = {
         "side": int(side),
         "entry": float(entry),
@@ -75,9 +86,17 @@ def step(pos: dict, o: float, h: float, l: float, c: float,
          flip: bool, p: Params) -> list[dict]:
     """Advance the open position by one closed bar; return the exit legs."""
     events: list[dict] = []
+    rem = pos["remaining"]
+
+    # Signal-only (hold strategy): exit the whole position on the opposite signal.
+    if pos.get("mode") == "signal" or pos.get("stop") is None:
+        if flip:
+            events.append({"frac": rem, "price": c, "reason": "EXIT"})
+            pos["remaining"] = 0.0
+        return events
+
     stop = pos["stop"]
     liq = pos.get("liq")
-    rem = pos["remaining"]
 
     if pos["side"] == 1:  # ---- LONG ----
         # Liquidation bites before the stop only if it sits ABOVE the stop.

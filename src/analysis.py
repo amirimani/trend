@@ -61,7 +61,7 @@ def evaluate(full_equity: pd.Series, all_trades: list, lo, hi,
 
 def grid_search(df: pd.DataFrame, costs: Costs, split, grid: dict | None = None,
                 min_trades: int = 20, base: Params | None = None,
-                ppy: float = BARS_PER_YEAR, half_min: int = 6):
+                ppy: float = BARS_PER_YEAR, half_min: int = 6, strict: bool = True):
     """Select parameters with strict anti-over-fitting gates (no OOS leakage).
 
     The in-sample window is split into two contiguous halves; a config is kept
@@ -102,12 +102,17 @@ def grid_search(df: pd.DataFrame, costs: Costs, split, grid: dict | None = None,
         sh1, sh2 = m1["sharpe"], m2["sharpe"]
         if not (sh1 == sh1 and sh2 == sh2):
             continue
-        # Consistency gate: must be profitable in BOTH in-sample halves.
-        if sh1 <= 0 or sh2 <= 0 or m1["total_return"] <= 0 or m2["total_return"] <= 0:
-            continue
-        score = min(sh1, sh2) - trials_penalty / math.sqrt(nt)   # deflated hurdle
-        if score <= 0:                                           # didn't clear it
-            continue
+        if strict:
+            # Consistency gate: must be profitable in BOTH in-sample halves,
+            # and clear a sample-size/trials-deflated Sharpe hurdle.
+            if sh1 <= 0 or sh2 <= 0 or m1["total_return"] <= 0 or m2["total_return"] <= 0:
+                continue
+            score = min(sh1, sh2) - trials_penalty / math.sqrt(nt)
+            if score <= 0:
+                continue
+        else:
+            # Lenient (e.g. "hold" mode: few, mostly-in-market trades).
+            score = min(sh1, sh2)
         if best is None or score > best[0]:
             oos_m = evaluate(res.equity, res.trades, split, df.index[-1], ppy)
             best = (score, p, is_m, oos_m, res)
@@ -131,17 +136,24 @@ def analyze_symbol(df: pd.DataFrame, costs: Costs | None = None,
     costs = costs or Costs()
     base = base or Params()
     ppy = periods_per_year(timeframe)
-    grid = grid or grid_for(timeframe, allow_short=base.allow_short)
-    # Trade floors: enough samples to trust the stats (anti-over-fit). Daily has
-    # fewer bars, but we still demand a meaningful sample or we fall back.
     daily = timeframe_hours(timeframe) >= 24
-    min_trades = 12 if daily else 20
-    half_min = 4 if daily else 6
     split_i = int(len(df) * split_frac)
     split = df.index[split_i]
 
-    found = grid_search(df, costs, split, grid=grid, ppy=ppy,
-                        min_trades=min_trades, half_min=half_min, base=base)
+    if base.strategy == "hold":
+        # Buy & hold with a bear filter: search the trend-MA length only,
+        # with lenient gates (few, mostly-in-market trades).
+        grid = grid or {"regime_ema": ([100, 150, 200, 250] if daily
+                                       else [150, 200, 300, 400])}
+        found = grid_search(df, costs, split, grid=grid, ppy=ppy,
+                            min_trades=3, half_min=1, base=base, strict=False)
+    else:
+        grid = grid or grid_for(timeframe, allow_short=base.allow_short)
+        # Trade floors: enough samples to trust the stats (anti-over-fit).
+        min_trades = 12 if daily else 20
+        half_min = 4 if daily else 6
+        found = grid_search(df, costs, split, grid=grid, ppy=ppy,
+                            min_trades=min_trades, half_min=half_min, base=base)
     if found is None:
         # Fall back to the base settings if nothing cleared the trade threshold.
         p = base
