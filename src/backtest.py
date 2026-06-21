@@ -35,6 +35,8 @@ class Costs:
     slippage: float = 0.0005  # 0.05% per side
     init_cash: float = 10_000.0
     maint_margin: float = 0.005  # maintenance-margin rate for liquidation price
+    funding_8h: float = 0.0   # avg perpetual funding per 8h (0 = none/spot). Longs
+                              # pay / shorts receive when positive (the usual case).
 
 
 @dataclass
@@ -75,6 +77,9 @@ def run_backtest(df: pd.DataFrame, p: Params, costs: Costs) -> BacktestResult:
     fee, slip = costs.fee, costs.slippage
     cash = costs.init_cash
     lev = max(1.0, float(getattr(p, "leverage", 1.0)))
+    # Bar duration (hours) for funding accrual.
+    bar_hours = (float(pd.Series(idx).diff().median().total_seconds() / 3600.0)
+                 if len(idx) > 2 else 4.0)
     n = len(df)
 
     # Position state (isolated margin = full equity; supports partial exits and
@@ -111,6 +116,10 @@ def run_backtest(df: pd.DataFrame, p: Params, costs: Costs) -> BacktestResult:
                     px = buy_fill(leg["price"])
                     realized_pnl += units * (entry_price - px) - units * px * fee
             if pos["remaining"] <= 1e-12:    # fully closed -> record the trade
+                if costs.funding_8h:         # perpetual funding over the holding time
+                    n_fund = ((i - entry_bar) * bar_hours) / 8.0
+                    fund = costs.funding_8h * (lev * entry_capital) * n_fund
+                    realized_pnl += fund if pos["side"] == -1 else -fund
                 cash = max(0.0, entry_capital + realized_pnl)   # isolated: can't go < 0
                 pnl = cash - entry_capital
                 trades.append(Trade(

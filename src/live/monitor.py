@@ -87,11 +87,12 @@ def load_params() -> Params:
 # Futures cost/risk settings.
 TAKER_FEE = _f("TAKER_FEE", 0.0004)      # Binance USDT-M futures taker ~0.04%
 MAINT_MARGIN = _f("MAINT_MARGIN", 0.005)  # maintenance margin (liquidation price)
+FUNDING_8H = _f("FUNDING_8H", 0.0001)     # avg perpetual funding per 8h (~0.01%)
 
 
 def _costs():
     from src.backtest import Costs
-    return Costs(fee=TAKER_FEE, maint_margin=MAINT_MARGIN)
+    return Costs(fee=TAKER_FEE, maint_margin=MAINT_MARGIN, funding_8h=FUNDING_8H)
 
 
 TIMEFRAME = os.getenv("TIMEFRAME", "4h")

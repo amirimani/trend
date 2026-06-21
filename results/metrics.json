@@ -4,7 +4,8 @@
     "fee": 0.001,
     "slippage": 0.0005,
     "init_cash": 10000.0,
-    "maint_margin": 0.005
+    "maint_margin": 0.005,
+    "funding_8h": 0.0
   },
   "default_params": {
     "ema_fast": 50,
