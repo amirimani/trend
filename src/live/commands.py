@@ -29,6 +29,7 @@ MENU = [
     ("analyze_all", "تحلیل مجدد همهٔ ارزهای فعال"),
     ("backtest", "بک‌تست و نمودار یک ارز: /backtest SOL"),
     ("backtest_all", "تحلیل نموداری همهٔ ارزها"),
+    ("walkforward", "آزمون Walk-Forward (expectancy واقعی): /walkforward SOL"),
     ("report", "نمایش دوبارهٔ نتیجهٔ تحلیل ذخیره‌شده: /report SOL"),
     ("add", "افزودن ارز: /add SOL/USDT"),
     ("remove", "حذف ارز: /remove SOL"),
@@ -189,6 +190,12 @@ def cmd_backtest(ctx, arg=None):
     if not arg:
         return "نماد را بده: مثلا `/backtest SOL/USDT`"
     return ctx.start_backtest(arg)
+
+
+def cmd_walkforward(ctx, arg=None):
+    if not arg:
+        return "نماد را بده: مثلا `/walkforward SOL/USDT`"
+    return ctx.start_walkforward(arg)
 
 
 def cmd_list(ctx, arg=None):
@@ -469,7 +476,8 @@ _HANDLERS = {
     "enable": cmd_enable, "disable": cmd_disable, "analyze": cmd_analyze,
     "analyze_all": cmd_analyze_all, "analyzeall": cmd_analyze_all,
     "backtest": cmd_backtest, "backtest_all": cmd_backtest_all,
-    "backtestall": cmd_backtest_all, "report": cmd_report,
+    "backtestall": cmd_backtest_all, "walkforward": cmd_walkforward,
+    "wf": cmd_walkforward, "report": cmd_report,
 }
 
 
