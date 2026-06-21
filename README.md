@@ -263,6 +263,30 @@ The service:
 `.env` only sets the **seed/default** params for new coins — each coin's real
 parameters come from `/analyze`.
 
+## Collect real data on the server → analyse it anywhere
+
+If the analysis runs somewhere without Binance access, collect data where you
+*do* have it (your server) and commit it:
+
+```bash
+# on the server (has Binance + ccxt):
+python3 fetch_market_data.py --symbols BTC/USDT,SOL/USDT,ETH/USDT,XRP/USDT \
+        --timeframes 4h,1d --since 2019-01-01 --market future --push
+```
+
+This writes `data/market/<SYMBOL>_<TF>.csv` (+ `manifest.json`) and pushes them.
+Then anywhere with the repo:
+
+```bash
+git pull
+python3 analyze_market.py            # walk-forward + IS/OOS per coin/tf/strategy
+python3 analyze_market.py --tf 4h    # filter; --leverage, --short, --fee also available
+```
+
+`analyze_market.py` reports, for each file, the **walk-forward expectancy**
+(average net return per out-of-sample trade) for both `trend` and `hold` — the
+honest "is the average positive?" measure.
+
 ## Layout
 
 ```
