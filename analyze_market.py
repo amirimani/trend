@@ -47,13 +47,15 @@ def main():
     ap.add_argument("--leverage", type=float, default=1.0)
     ap.add_argument("--short", action="store_true", help="allow shorts (futures)")
     ap.add_argument("--fee", type=float, default=0.0004, help="per-side taker fee")
+    ap.add_argument("--funding", type=float, default=0.0001,
+                    help="avg perpetual funding per 8h (0 to disable)")
     args = ap.parse_args()
 
     files = sorted(glob.glob(os.path.join(MKT, "*.csv")))
     if not files:
         print(f"No data in {MKT}/. Run fetch_market_data.py on the server first.")
         return
-    costs = Costs(fee=args.fee)
+    costs = Costs(fee=args.fee, funding_8h=args.funding)
 
     print(f"{'symbol':12s} {'tf':4s} {'strat':6s} {'WF exp/trade':>12s} {'WF win':>7s} "
           f"{'WF total':>9s} {'OOS Sharpe':>11s} {'verdict':>8s}")
