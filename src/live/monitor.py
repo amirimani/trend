@@ -140,11 +140,11 @@ class Context:
         return f"🔬 تحلیل `{symbol}` شروع شد؛ نتیجه را به‌زودی می‌فرستم…"
 
     def start_analysis_all(self) -> str:
-        """Re-tune every enabled coin, SEQUENTIALLY (gentle on the exchange)."""
-        syms = [s for s, e in st.watchlist(self.state).items()
-                if e.get("enabled") and s not in self.analyzing]
+        """Re-tune EVERY coin (enabled or disabled), SEQUENTIALLY. Coins that
+        pass validation are re-enabled; failing ones stay disabled."""
+        syms = [s for s in st.watchlist(self.state) if s not in self.analyzing]
         if not syms:
-            return "هیچ ارز فعالی برای تحلیل نیست (یا همه در حال تحلیل‌اند)."
+            return "ارزی برای تحلیل نیست (یا همه در حال تحلیل‌اند)."
         for s in syms:
             self.analyzing.add(s)
 
@@ -152,7 +152,7 @@ class Context:
             for s in syms:
                 _analysis_worker(self, s, auto=False)   # discards itself in finally
         threading.Thread(target=run, daemon=True).start()
-        return ("🔬 تحلیل مجدد همهٔ ارزهای فعال شروع شد:\n"
+        return ("🔬 تحلیل مجدد همهٔ ارزها شروع شد (شاملِ غیرفعال‌ها):\n"
                 + "، ".join(f"`{s}`" for s in syms)
                 + "\nنتایج به‌ترتیب آماده‌شدن ارسال می‌شوند…")
 
@@ -531,8 +531,8 @@ def _analysis_worker(ctx: Context, symbol: str, auto: bool = False) -> None:
                 "n_bars": summary["n_bars"], "verdict": verdict,
                 "in_sample": summary["in_sample"], "out_sample": summary["out_sample"],
             }
-            if verdict == "fail":  # quality guard: auto-disable poor performers
-                wl[symbol]["enabled"] = False
+            # Quality guard: disable on fail, RE-ENABLE when it passes again.
+            wl[symbol]["enabled"] = verdict != "fail"
             enabled = wl[symbol]["enabled"]
             st.save_state(ctx.state)
         footer = verdict_note(verdict, symbol, enabled)
