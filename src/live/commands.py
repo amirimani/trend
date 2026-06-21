@@ -387,46 +387,41 @@ def cmd_backtest_all(ctx, arg=None):
 
 
 def cmd_compare(ctx, arg=None):
-    """Rank watched coins by their out-of-sample Sharpe to ease selection."""
+    """Rank watched coins by their WALK-FORWARD expectancy (the honest metric)."""
     wl = st.watchlist(ctx.state)
     if not wl:
         return "📭 واچ‌لیست خالی است. با `/add SOL/USDT` اضافه کن."
     analyzed, pending = [], []
     for sym, e in wl.items():
         a = e.get("analysis")
-        if a and a.get("out_sample"):
+        if a and a.get("walk_forward") and a["walk_forward"].get("trades"):
             analyzed.append((sym, e, a))
         else:
             pending.append(sym)
 
-    def _sh(item):
-        v = item[2]["out_sample"].get("sharpe")
-        return v if v == v else -1e9  # NaN last
-    analyzed.sort(key=_sh, reverse=True)
+    analyzed.sort(key=lambda it: it[2]["walk_forward"].get("expectancy", -1e9), reverse=True)
 
     medals = ["🥇", "🥈", "🥉"]
     vmark = {"good": "✅", "weak": "⚠️", "fail": "🛑"}
     lines = []
     for i, (sym, e, a) in enumerate(analyzed):
-        oos = a["out_sample"]
-        sh = oos.get("sharpe")
-        sh_s = f"{sh:.2f}" if sh == sh else "—"
+        wf = a["walk_forward"]
         rank = medals[i] if i < 3 else "•"
         flag = "🟢" if e.get("enabled") else "⚪️"
         lines.append(
             f"{rank} `{sym}` {flag}{vmark.get(a.get('verdict'), '')} — "
-            f"Sharpe `{sh_s}` | بازده `{oos['total_return']*100:+.0f}%` | "
-            f"افت `{oos['max_drawdown']*100:.0f}%` | برد `{oos['win_rate']*100:.0f}%` | "
-            f"معاملات `{oos['num_trades']}`"
+            f"میانگین/معامله `{wf['expectancy']*100:+.2f}%` | "
+            f"برد `{wf['win_rate']*100:.0f}%` | مرکب `{wf['total_return']*100:+.0f}%` | "
+            f"معاملات `{wf['trades']}`"
         )
-    head = "📊 *مقایسهٔ واچ‌لیست* — بر اساس آزمون برون‌نمونه (OOS)\n\n"
+    head = "📊 *مقایسهٔ واچ‌لیست* — بر اساس Walk-Forward (expectancy برون‌نمونه)\n\n"
     body = "\n".join(lines) if lines else "هنوز هیچ ارزی تحلیل نشده."
     foot = ""
-    if analyzed:
-        foot += f"\n\n🏆 بهترین ریسک‌به‌ریوارد: `{analyzed[0][0]}`"
+    if analyzed and analyzed[0][2]["walk_forward"]["expectancy"] > 0:
+        foot += f"\n\n🏆 بهترین: `{analyzed[0][0]}`"
     if pending:
         foot += "\n🔘 تحلیل‌نشده: " + "، ".join(f"`{s}`" for s in pending) + " — `/analyze` بزن"
-    foot += "\n_رتبه‌بندی بر اساس Sharpe برون‌نمونه است؛ تضمین آینده نیست._"
+    foot += "\n_میانگینِ مثبت = اِجِ تعمیم‌پذیر؛ تضمین آینده نیست._"
     return head + body + foot
 
 
@@ -457,8 +452,9 @@ def cmd_report(ctx, arg=None):
         "params": e["params"], "tuned": a.get("tuned", False),
         "range": a.get("range", ["?", "?"]), "n_bars": a.get("n_bars", 0),
         "in_sample": a["in_sample"], "out_sample": a["out_sample"],
+        "walk_forward": a.get("walk_forward"),
     }
-    verdict = a.get("verdict") or monitor.quality_verdict(a["out_sample"])
+    verdict = a.get("verdict") or monitor.wf_verdict(a.get("walk_forward"))
     footer = monitor.verdict_note(verdict, sym, e.get("enabled", True))
     when = f"\n_آخرین تحلیل: {_dt(e.get('analyzed_at'))}_"
     return monitor.format_analysis(summary, sym, ctx.timeframe, footer) + when

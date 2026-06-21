@@ -351,10 +351,10 @@ def format_result(trade: dict, symbol: str, timeframe: str) -> str:
 
 
 def quality_verdict(oos: dict) -> str:
-    """Rate a tuned strategy by its out-of-sample result: good / weak / fail."""
+    """Single-split out-of-sample rating (legacy / reference)."""
     sh = oos.get("sharpe", float("nan"))
     ret = oos.get("total_return", float("nan"))
-    if sh != sh:  # NaN -> not enough trades to judge
+    if sh != sh:
         return "weak"
     if sh < MIN_OOS_SHARPE or ret < 0:
         return "fail"
@@ -363,16 +363,30 @@ def quality_verdict(oos: dict) -> str:
     return "good"
 
 
+def wf_verdict(wf: dict) -> str:
+    """Rate by WALK-FORWARD expectancy (window-robust, aggregated over many
+    unseen folds). This drives the live enable/disable decision."""
+    if not wf:
+        return "weak"
+    n = wf.get("trades", 0)
+    exp = wf.get("expectancy")
+    tot = wf.get("total_return", 0.0)
+    if n < 5 or exp is None:
+        return "weak"                 # too few out-of-sample trades to judge
+    if exp <= 0 or tot <= 0:
+        return "fail"                 # negative average -> no edge
+    if exp < 0.005:
+        return "weak"                 # positive but thin (<0.5%/trade)
+    return "good"
+
+
 def verdict_note(verdict: str, symbol: str, enabled: bool) -> str:
     if verdict == "fail":
-        if not enabled:
-            return (f"🛑 *اعتبارسنجی رد شد* (برون‌نمونه منفی) — `{symbol}` خودکار "
-                    f"*غیرفعال* شد. برای نادیده‌گرفتن: `/enable {symbol}`")
-        return (f"🛑 *برون‌نمونه منفی است* — استراتژی روی `{symbol}` اعتبارسنجی نشد؛ "
-                f"توصیه: `/disable {symbol}`")
+        return (f"🛑 *Walk-Forward منفی* — `{symbol}` اِجِ تعمیم‌پذیر ندارد و خودکار "
+                f"*غیرفعال* شد. برای نادیده‌گرفتن: `/enable {symbol}`")
     if verdict == "weak":
-        return "⚠️ نتیجهٔ برون‌نمونه ضعیف است؛ با احتیاط استفاده کن."
-    return "✅ اعتبارسنجی موفق بود — این پارامترها ذخیره و برای رصد استفاده می‌شود."
+        return ("⚠️ Walk-Forward مثبتِ نازک یا نمونهٔ کم — با احتیاط (فعال ماند).")
+    return "✅ *Walk-Forward مثبت* — اِجِ تعمیم‌پذیر دارد؛ فعال شد."
 
 
 def _params_summary(p: dict) -> str:
@@ -410,18 +424,21 @@ def _params_summary(p: dict) -> str:
 def format_analysis(summary: dict, symbol: str, timeframe: str, footer: str = "") -> str:
     p = summary["params"]
     is_m, oos = summary["in_sample"], summary["out_sample"]
+    wf = summary.get("walk_forward") or {}
     tuned = "بهینه‌شده" if summary.get("tuned") else "پیش‌فرض (بهینه‌سازی نتیجه نداد)"
+    wf_line = "🔁 *Walk-Forward:* دادهٔ کافی نبود"
+    if wf.get("trades"):
+        wf_line = (f"🔁 *Walk-Forward (معیارِ اصلی):* میانگین هر معامله "
+                   f"`{wf['expectancy']*100:+.2f}%` | برد `{wf['win_rate']*100:.0f}%` | "
+                   f"مرکب `{wf['total_return']*100:+.0f}%` | معاملات `{wf['trades']}`")
     return (
         f"🔬 *تحلیل {symbol}* — {timeframe}  ({tuned})\n"
         f"بازه: {summary['range'][0][:10]} → {summary['range'][1][:10]} "
         f"({summary['n_bars']} کندل)\n\n"
         f"⚙️ *پارامترهای انتخابی:*\n{_params_summary(p)}\n\n"
-        f"📊 *درون‌نمونه (انتخاب):* بازده `{is_m['total_return']*100:+.1f}%` | "
-        f"Sharpe `{is_m['sharpe']:.2f}` | برد `{is_m['win_rate']*100:.0f}%` | "
-        f"معاملات `{is_m['num_trades']}`\n"
-        f"🧪 *برون‌نمونه (آزمون صادقانه):* بازده `{oos['total_return']*100:+.1f}%` | "
-        f"Sharpe `{oos['sharpe']:.2f}` | برد `{oos['win_rate']*100:.0f}%` | "
-        f"DD `{oos['max_drawdown']*100:.1f}%` | معاملات `{oos['num_trades']}`\n\n"
+        f"{wf_line}\n"
+        f"_تکِ‌اسپلیت (مرجع):_ درون‌نمونه Sharpe `{is_m['sharpe']:.2f}` / "
+        f"برون‌نمونه Sharpe `{oos['sharpe']:.2f}`\n\n"
         f"{footer}"
     )
 
@@ -567,7 +584,7 @@ def _analysis_worker(ctx: Context, symbol: str, auto: bool = False) -> None:
     try:
         summary = run_analysis(symbol, ctx.fetch_history_fn, ctx.timeframe, ANALYZE_SINCE,
                                costs=_costs(), base=ctx.default_params)
-        verdict = quality_verdict(summary["out_sample"])
+        verdict = wf_verdict(summary.get("walk_forward"))   # decision = walk-forward
         with ctx.lock:
             wl = st.watchlist(ctx.state)
             if symbol not in wl:
@@ -578,6 +595,7 @@ def _analysis_worker(ctx: Context, symbol: str, auto: bool = False) -> None:
                 "tuned": summary["tuned"], "range": summary["range"],
                 "n_bars": summary["n_bars"], "verdict": verdict,
                 "in_sample": summary["in_sample"], "out_sample": summary["out_sample"],
+                "walk_forward": summary.get("walk_forward"),
             }
             # Quality guard: disable on fail, RE-ENABLE when it passes again.
             wl[symbol]["enabled"] = verdict != "fail"
