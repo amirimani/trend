@@ -2,6 +2,8 @@
 data/*.csv.gz
 # Derived 4h dataset - rebuilt from raw
 data/*.parquet
+# NOTE: data/market/*.csv (collected by fetch_market_data.py) IS tracked on
+# purpose, so it can be pushed from the server and analysed elsewhere.
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
