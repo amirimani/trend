@@ -127,6 +127,7 @@ class Context:
         "started_at": datetime.now(timezone.utc).isoformat(), "symbols": {}})
     analyzing: set = field(default_factory=set)
     backtesting: set = field(default_factory=set)
+    walkforwarding: set = field(default_factory=set)
     # injected so tests can substitute local data
     fetch_recent_fn: callable = fetch_recent
     fetch_history_fn: callable = fetch_history
@@ -165,6 +166,17 @@ class Context:
         self.backtesting.add(symbol)
         threading.Thread(target=_backtest_worker, args=(self, symbol), daemon=True).start()
         return f"🧪 بک‌تست `{symbol}` شروع شد؛ نتیجه و نمودار به‌زودی می‌آید…"
+
+    def start_walkforward(self, symbol: str) -> str:
+        symbol = st.normalize_symbol(symbol)
+        if symbol not in st.watchlist(self.state):
+            return f"`{symbol}` در واچ‌لیست نیست."
+        if symbol in self.walkforwarding:
+            return f"⏳ Walk-Forward `{symbol}` در حال اجراست."
+        self.walkforwarding.add(symbol)
+        threading.Thread(target=_walkforward_worker, args=(self, symbol), daemon=True).start()
+        return (f"🔁 Walk-Forward `{symbol}` شروع شد — تیون روی پنجره‌های غلتان و "
+                f"معامله روی دادهٔ ندیده. کمی طول می‌کشد…")
 
     def start_backtest_all(self) -> str:
         """Chart-backtest every coin, SEQUENTIALLY (matplotlib isn't thread-safe
@@ -515,6 +527,42 @@ def check_all(ctx: Context) -> None:
 # --------------------------------------------------------------------------- #
 # Background analysis worker
 # --------------------------------------------------------------------------- #
+def format_walkforward(symbol: str, timeframe: str, wf: dict) -> str:
+    if wf.get("trades", 0) == 0:
+        return f"🔁 *Walk-Forward {symbol}* — {timeframe}\nمعاملهٔ برون‌نمونه‌ای تولید نشد."
+    exp = wf["expectancy"] * 100
+    verdict = ("✅ میانگین *مثبت* (اِجِ کوچک)" if exp > 0
+               else "🛑 میانگین *منفی* — اِج پایدار نیست")
+    folds = "، ".join(f"{f['return']*100:+.0f}%" for f in wf["fold_detail"])
+    return (
+        f"🔁 *Walk-Forward {symbol}* — {timeframe}\n"
+        f"معاملاتِ کاملاً برون‌نمونه روی `{wf['folds']}` پنجرهٔ غلتان:\n\n"
+        f"🎯 *میانگین هر معامله (expectancy):* `{exp:+.2f}%`\n"
+        f"نرخ برد: `{wf['win_rate']*100:.0f}%` | تعداد معاملات: `{wf['trades']}`\n"
+        f"بازده مرکبِ OOS: `{wf['total_return']*100:+.0f}%`\n"
+        f"بهترین/بدترین معامله: `{wf['best']*100:+.0f}%` / `{wf['worst']*100:+.0f}%`\n\n"
+        f"به‌ازای هر پنجره: {folds}\n\n"
+        f"*{verdict}*\n"
+        f"_این صادقانه‌ترین آزمون است: هر معامله روی دادهٔ ندیده. تضمین آینده نیست._"
+    )
+
+
+def _walkforward_worker(ctx: Context, symbol: str) -> None:
+    from src.analysis import walk_forward
+    try:
+        df = ctx.fetch_history_fn(symbol, ctx.timeframe, ANALYZE_SINCE)
+        if df is None or len(df) < 400:
+            raise ValueError("دادهٔ کافی نیست")
+        wf = walk_forward(df, _costs(), ctx.timeframe, base=ctx.default_params)
+        ctx.notifier.send(format_walkforward(symbol, ctx.timeframe, wf))
+        log.info("Walk-forward done for %s.", symbol)
+    except Exception as e:
+        log.exception("Walk-forward failed for %s: %s", symbol, e)
+        ctx.notifier.send(f"❌ Walk-Forward `{symbol}` ناموفق بود: {e}")
+    finally:
+        ctx.walkforwarding.discard(symbol)
+
+
 def _analysis_worker(ctx: Context, symbol: str, auto: bool = False) -> None:
     try:
         summary = run_analysis(symbol, ctx.fetch_history_fn, ctx.timeframe, ANALYZE_SINCE,

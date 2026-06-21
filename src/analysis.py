@@ -122,6 +122,67 @@ def grid_search(df: pd.DataFrame, costs: Costs, split, grid: dict | None = None,
     return p, is_m, oos_m, res
 
 
+def walk_forward(df: pd.DataFrame, costs: Costs | None = None, timeframe: str = "4h",
+                 base: Params | None = None) -> dict:
+    """Rolling walk-forward: tune on each in-sample window, then trade the next
+    (unseen) out-of-sample window; aggregate ALL out-of-sample trades.
+
+    The honest test of "is the average positive?" — every counted trade happened
+    on data the parameters had never seen, across many market regimes.
+    """
+    costs = costs or Costs()
+    base = base or Params()
+    ppy = periods_per_year(timeframe)
+    hold = base.strategy == "hold"
+    daily = timeframe_hours(timeframe) >= 24
+
+    if daily:
+        is_bars, oos_bars = 504, 126                         # ~2y train, ~6m test
+    else:
+        bpd = 24 / timeframe_hours(timeframe)
+        is_bars, oos_bars = int(365 * bpd), int(120 * bpd)   # ~1y train, ~4m test
+
+    all_oos_rets, folds = [], []
+    start = 0
+    while start + is_bars + oos_bars <= len(df):
+        fold = df.iloc[start: start + is_bars + oos_bars]
+        split = fold.index[is_bars]
+        if hold:
+            grid = {"regime_ema": ([100, 150, 200, 250] if daily else [150, 200, 300, 400])}
+            found = grid_search(fold, costs, split, grid=grid, ppy=ppy,
+                                min_trades=3, half_min=1, base=base, strict=False)
+        else:
+            found = grid_search(fold, costs, split,
+                                grid=grid_for(timeframe, base.allow_short), ppy=ppy,
+                                min_trades=(12 if daily else 20),
+                                half_min=(4 if daily else 6), base=base)
+        res = run_backtest(fold, base, costs) if found is None else found[3]
+        split_ts = _ts(split)
+        oos_rets = [t.ret for t in res.trades if t.entry_time >= split_ts]
+        all_oos_rets += oos_rets
+        if oos_rets:
+            comp = 1.0
+            for r in oos_rets:
+                comp *= (1 + r)
+            folds.append({"oos_start": str(split)[:10], "trades": len(oos_rets),
+                          "return": comp - 1})
+        start += oos_bars
+
+    import numpy as np
+    n = len(all_oos_rets)
+    if n == 0:
+        return {"trades": 0, "folds": 0, "fold_detail": []}
+    rets = np.array(all_oos_rets)
+    return {
+        "trades": n, "folds": len(folds),
+        "expectancy": float(rets.mean()),        # avg net return per OOS trade
+        "win_rate": float((rets > 0).mean()),
+        "total_return": float(np.prod(1 + rets) - 1),  # compounded across all OOS
+        "best": float(rets.max()), "worst": float(rets.min()),
+        "fold_detail": folds,
+    }
+
+
 def analyze_symbol(df: pd.DataFrame, costs: Costs | None = None,
                    split_frac: float = 0.7, grid: dict | None = None,
                    timeframe: str = "4h", base: Params | None = None) -> dict:
