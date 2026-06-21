@@ -38,14 +38,18 @@ def make_exchange(market: str):
 
 def fetch_one(ex, symbol: str, timeframe: str, since: str) -> pd.DataFrame:
     since_ms = ex.parse8601(f"{since}T00:00:00Z")
-    limit, rows, cursor = 1500, [], since_ms
+    limit, rows, cursor, last = 1000, [], since_ms, None   # Binance caps at 1000/call
     while True:
         batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=limit)
         if not batch:
             break
         rows += batch
-        cursor = batch[-1][0] + 1
-        if len(batch) < limit:
+        newest = batch[-1][0]
+        if newest == last:          # no forward progress -> reached the end
+            break
+        last = newest
+        cursor = newest + 1
+        if len(batch) < limit:      # last (partial) page
             break
         time.sleep(ex.rateLimit / 1000.0)
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
