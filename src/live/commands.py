@@ -31,6 +31,8 @@ MENU = [
     ("backtest_all", "تحلیل نموداری همهٔ ارزها"),
     ("walkforward", "آزمون Walk-Forward (expectancy واقعی): /walkforward SOL"),
     ("xsmom", "سبد مومنتوم مقطعی Long/Short"),
+    ("xsmom_status", "آخرین سبد مومنتوم ذخیره‌شده"),
+    ("xsmom_chart", "نمودار بک‌تست سبد مومنتوم"),
     ("report", "نمایش دوبارهٔ نتیجهٔ تحلیل ذخیره‌شده: /report SOL"),
     ("add", "افزودن ارز: /add SOL/USDT"),
     ("remove", "حذف ارز: /remove SOL"),
@@ -64,6 +66,13 @@ def main_menu_kb(ctx) -> dict:
         rows.append(row)
     rows.append([_btn("❓ راهنما", "help")])
     return {"inline_keyboard": rows}
+
+
+def xsmom_kb() -> dict:
+    return {"inline_keyboard": [
+        [_btn("🔄 محاسبهٔ دوباره", "xsmom"), _btn("📈 نمودار", "xsmom_chart")],
+        [_btn("⬅️ منوی اصلی", "menu")],
+    ]}
 
 
 def symbol_kb(sym: str) -> dict:
@@ -393,6 +402,31 @@ def cmd_xsmom(ctx, arg=None):
     return ctx.start_xsmom(announce=True)
 
 
+def cmd_xsmom_status(ctx, arg=None):
+    """Show the LAST posted momentum basket from state (no recompute)."""
+    x = ctx.state.get("xsmom")
+    if not x or not (x.get("longs") or x.get("shorts")):
+        return ("🔀 هنوز سبد مومنتومی محاسبه نشده.\n"
+                "برای محاسبهٔ سبد فعلی `/xsmom` و برای نمودار تاریخی `/xsmom_chart` را بزن.")
+    longs = "، ".join(f"`{s.split('/')[0]}`" for s in x.get("longs", [])) or "—"
+    shorts = "، ".join(f"`{s.split('/')[0]}`" for s in x.get("shorts", [])) or "—"
+    lines = [
+        "🔀 *آخرین سبد مومنتوم (ذخیره‌شده)*",
+        f"بازچینش: {_dt(x.get('last_rebalance'))} ({_age(x.get('last_rebalance'))})",
+        f"تا کندلِ: {_dt(x.get('asof'))}",
+        f"📈 لانگ: {longs}",
+    ]
+    if x.get("shorts"):
+        lines.append(f"📉 شورت: {shorts}")
+    lines.append("\n_برای به‌روزرسانی `/xsmom`، برای نمودار `/xsmom_chart`._")
+    return "\n".join(lines)
+
+
+def cmd_xsmom_chart(ctx, arg=None):
+    """Backtest the momentum basket over full history and send an equity chart."""
+    return ctx.start_xsmom_chart()
+
+
 def cmd_compare(ctx, arg=None):
     """Rank watched coins by their WALK-FORWARD expectancy (the honest metric)."""
     wl = st.watchlist(ctx.state)
@@ -482,6 +516,8 @@ _HANDLERS = {
     "backtestall": cmd_backtest_all, "walkforward": cmd_walkforward,
     "wf": cmd_walkforward, "report": cmd_report,
     "xsmom": cmd_xsmom, "momentum": cmd_xsmom, "basket": cmd_xsmom,
+    "xsmom_status": cmd_xsmom_status, "xsmomstatus": cmd_xsmom_status,
+    "xsmom_chart": cmd_xsmom_chart, "xsmomchart": cmd_xsmom_chart,
 }
 
 

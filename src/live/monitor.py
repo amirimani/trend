@@ -147,6 +147,7 @@ class Context:
     backtesting: set = field(default_factory=set)
     walkforwarding: set = field(default_factory=set)
     xsmomming: bool = False
+    xsmom_charting: bool = False
     # injected so tests can substitute local data
     fetch_recent_fn: callable = fetch_recent
     fetch_history_fn: callable = fetch_history
@@ -223,6 +224,15 @@ class Context:
                          daemon=True).start()
         return (f"🔀 محاسبهٔ سبد مومنتوم مقطعی شروع شد ({len(XSMOM_UNIVERSE)} ارز، "
                 f"{XSMOM_TIMEFRAME})؛ نتیجه به‌زودی می‌آید…")
+
+    def start_xsmom_chart(self) -> str:
+        """Backtest the momentum basket over full history and send an equity chart."""
+        if self.xsmom_charting:
+            return "⏳ نمودار سبد مومنتوم در حال آماده‌سازی است."
+        self.xsmom_charting = True
+        threading.Thread(target=_xsmom_chart_worker, args=(self,), daemon=True).start()
+        return (f"📈 بک‌تست تاریخیِ سبد مومنتوم شروع شد ({len(XSMOM_UNIVERSE)} ارز، "
+                f"{XSMOM_TIMEFRAME})؛ دریافت داده و رسم نمودار کمی طول می‌کشد…")
 
 
 # --------------------------------------------------------------------------- #
@@ -690,9 +700,11 @@ def _xsmom_worker(ctx: Context, announce: bool = True, force: bool = False) -> N
             }
             st.save_state(ctx.state)
         if announce:
+            from src.live import commands
             prefix = "🔄 *بازچینش خودکار سبد*\n" if not force else ""
             ctx.notifier.send(prefix + format_basket(basket, XSMOM_TIMEFRAME,
-                              XSMOM_REBALANCE_DAYS, prev))
+                              XSMOM_REBALANCE_DAYS, prev),
+                              reply_markup=commands.xsmom_kb())
         log.info("XS-mom basket: %d longs / %d shorts of %d coins.",
                  len(basket["longs"]), len(basket["shorts"]), basket["n"])
     except Exception as e:
@@ -715,6 +727,94 @@ def maybe_rebalance_xsmom(ctx: Context) -> None:
     ctx.xsmomming = True
     log.info("XS-mom auto-rebalance triggered.")
     threading.Thread(target=_xsmom_worker, args=(ctx, True, False), daemon=True).start()
+
+
+def _plot_xsmom(eq, ew, btc, timeframe: str) -> str | None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+    except Exception:
+        return None
+    import tempfile
+
+    path = os.path.join(tempfile.gettempdir(), "xsmom_equity.png")
+    with _PLOT_LOCK:
+        fig = Figure(figsize=(11, 7))
+        ax = fig.subplots(2, 1, gridspec_kw={"height_ratios": [3, 1]})
+        ax[0].plot(eq.index, eq.values, label="XS-Momentum L/S", lw=1.4)
+        ax[0].plot(ew.index, ew.values, label="Equal-weight hold", lw=1.0, alpha=0.7)
+        if btc is not None:
+            ax[0].plot(btc.index, btc.values, label="BTC hold", lw=1.0, alpha=0.6)
+        ax[0].set_yscale("log")
+        ax[0].set_title(f"Cross-sectional momentum — {timeframe} (log equity)")
+        ax[0].legend(); ax[0].grid(alpha=0.3)
+        dd = eq / eq.cummax() - 1.0
+        ax[1].fill_between(dd.index, dd.values * 100, 0, color="red", alpha=0.4)
+        ax[1].set_title("Drawdown (%)"); ax[1].grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=110)
+    return path
+
+
+def _xsmom_chart_worker(ctx: Context) -> None:
+    from src.metrics import compute_metrics, periods_per_year
+    from src.xsmom import build_panel, equal_weight_hold, xsmom_equity
+    try:
+        bar_hours = timeframe_hours(XSMOM_TIMEFRAME)
+        rebalance_bars = max(1, round(XSMOM_REBALANCE_DAYS * 24.0 / bar_hours))
+        closes = {}
+        for sym in XSMOM_UNIVERSE:
+            try:
+                df = ctx.fetch_history_fn(sym, XSMOM_TIMEFRAME, ANALYZE_SINCE)
+            except Exception:
+                continue
+            if df is not None and len(df) > XSMOM_LOOKBACK + 2:
+                closes[sym] = df["close"].astype("float64").sort_index()
+        if len(closes) < 2:
+            ctx.notifier.send("⚠️ نمودار سبد: دادهٔ کافی برای هیچ ارزی به‌دست نیامد.")
+            return
+        panel = build_panel(closes)
+        eq = xsmom_equity(panel, XSMOM_LOOKBACK, XSMOM_TOP_K, rebalance_bars,
+                          TAKER_FEE, 0.0005, XSMOM_LONG_SHORT,
+                          funding_8h=FUNDING_8H, bar_hours=bar_hours)
+        ew = equal_weight_hold(panel)
+        btc_col = next((c for c in panel.columns if c.startswith("BTC")), None)
+        btc = None
+        if btc_col is not None:
+            b = panel[btc_col].dropna()
+            btc = b / b.iloc[0] * 10_000.0
+        ppy = periods_per_year(XSMOM_TIMEFRAME)
+        m, mew = compute_metrics(eq, [], ppy=ppy), compute_metrics(ew, [], ppy=ppy)
+        caption = (
+            f"📈 *بک‌تست سبد مومنتوم* — {XSMOM_TIMEFRAME} "
+            f"({'long/short' if XSMOM_LONG_SHORT else 'long-only'})\n"
+            f"جهان: {len(closes)} ارز | بازه: {str(panel.index[0])[:10]} → "
+            f"{str(panel.index[-1])[:10]}\n"
+            f"پارامتر: lookback `{XSMOM_LOOKBACK}` | top_k `{XSMOM_TOP_K}` | "
+            f"بازچینش هر `{XSMOM_REBALANCE_DAYS}` روز\n\n"
+            f"بازده کل: `{m['total_return']*100:+.1f}%` | CAGR `{m['cagr']*100:+.1f}%`\n"
+            f"Sharpe `{m['sharpe']:.2f}` | حداکثر افت `{m['max_drawdown']*100:.1f}%`\n"
+            f"📉 وزن‌برابرِ نگه‌داری: بازده `{mew['total_return']*100:+.1f}%` | "
+            f"افت `{mew['max_drawdown']*100:.1f}%`\n"
+            f"_شامل کارمزد و slippage روی turnover{' و funding' if FUNDING_8H else ''}. "
+            f"این بک‌تستِ کلِ تاریخ است، نه برون‌نمونه._"
+        )
+        png = _plot_xsmom(eq, ew, btc, XSMOM_TIMEFRAME)
+        if png:
+            ctx.notifier.send_photo(png, caption)
+            try:
+                os.remove(png)
+            except OSError:
+                pass
+        else:
+            ctx.notifier.send(caption)
+        log.info("XS-mom chart sent (%d coins, %d bars).", len(closes), len(panel))
+    except Exception as e:
+        log.exception("XS-mom chart failed: %s", e)
+        ctx.notifier.send(f"❌ نمودار سبد مومنتوم ناموفق بود: {e}")
+    finally:
+        ctx.xsmom_charting = False
 
 
 # --------------------------------------------------------------------------- #
