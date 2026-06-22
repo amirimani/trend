@@ -1,35 +1,182 @@
 {
-  "fetched_at": "2026-06-21T05:29:44.749917+00:00",
+  "fetched_at": "2026-06-22T07:43:13.563681+00:00",
   "market": "future",
   "since": "2019-01-01",
   "files": {
     "BTCUSDT_1d.csv": {
       "symbol": "BTC/USDT",
       "timeframe": "1d",
-      "rows": 2478,
+      "rows": 2479,
       "start": "2019-09-08 00:00:00+00:00",
-      "end": "2026-06-20 00:00:00+00:00"
-    },
-    "SOLUSDT_1d.csv": {
-      "symbol": "SOL/USDT",
-      "timeframe": "1d",
-      "rows": 2106,
-      "start": "2020-09-14 00:00:00+00:00",
-      "end": "2026-06-20 00:00:00+00:00"
+      "end": "2026-06-21 00:00:00+00:00"
     },
     "ETHUSDT_1d.csv": {
       "symbol": "ETH/USDT",
       "timeframe": "1d",
-      "rows": 2398,
+      "rows": 2399,
       "start": "2019-11-27 00:00:00+00:00",
-      "end": "2026-06-20 00:00:00+00:00"
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "SOLUSDT_1d.csv": {
+      "symbol": "SOL/USDT",
+      "timeframe": "1d",
+      "rows": 2107,
+      "start": "2020-09-14 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
     },
     "XRPUSDT_1d.csv": {
       "symbol": "XRP/USDT",
       "timeframe": "1d",
-      "rows": 2358,
+      "rows": 2359,
       "start": "2020-01-06 00:00:00+00:00",
-      "end": "2026-06-20 00:00:00+00:00"
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "BNBUSDT_1d.csv": {
+      "symbol": "BNB/USDT",
+      "timeframe": "1d",
+      "rows": 2324,
+      "start": "2020-02-10 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "ADAUSDT_1d.csv": {
+      "symbol": "ADA/USDT",
+      "timeframe": "1d",
+      "rows": 2334,
+      "start": "2020-01-31 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "AVAXUSDT_1d.csv": {
+      "symbol": "AVAX/USDT",
+      "timeframe": "1d",
+      "rows": 2098,
+      "start": "2020-09-23 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "DOGEUSDT_1d.csv": {
+      "symbol": "DOGE/USDT",
+      "timeframe": "1d",
+      "rows": 2173,
+      "start": "2020-07-10 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "LINKUSDT_1d.csv": {
+      "symbol": "LINK/USDT",
+      "timeframe": "1d",
+      "rows": 2348,
+      "start": "2020-01-17 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "DOTUSDT_1d.csv": {
+      "symbol": "DOT/USDT",
+      "timeframe": "1d",
+      "rows": 2130,
+      "start": "2020-08-22 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "LTCUSDT_1d.csv": {
+      "symbol": "LTC/USDT",
+      "timeframe": "1d",
+      "rows": 2356,
+      "start": "2020-01-09 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "TRXUSDT_1d.csv": {
+      "symbol": "TRX/USDT",
+      "timeframe": "1d",
+      "rows": 2350,
+      "start": "2020-01-15 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "ATOMUSDT_1d.csv": {
+      "symbol": "ATOM/USDT",
+      "timeframe": "1d",
+      "rows": 2327,
+      "start": "2020-02-07 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "NEARUSDT_1d.csv": {
+      "symbol": "NEAR/USDT",
+      "timeframe": "1d",
+      "rows": 2076,
+      "start": "2020-10-15 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "APTUSDT_1d.csv": {
+      "symbol": "APT/USDT",
+      "timeframe": "1d",
+      "rows": 1342,
+      "start": "2022-10-19 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "ARBUSDT_1d.csv": {
+      "symbol": "ARB/USDT",
+      "timeframe": "1d",
+      "rows": 1187,
+      "start": "2023-03-23 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "OPUSDT_1d.csv": {
+      "symbol": "OP/USDT",
+      "timeframe": "1d",
+      "rows": 1482,
+      "start": "2022-06-01 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "INJUSDT_1d.csv": {
+      "symbol": "INJ/USDT",
+      "timeframe": "1d",
+      "rows": 1405,
+      "start": "2022-08-17 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "SUIUSDT_1d.csv": {
+      "symbol": "SUI/USDT",
+      "timeframe": "1d",
+      "rows": 1146,
+      "start": "2023-05-03 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "UNIUSDT_1d.csv": {
+      "symbol": "UNI/USDT",
+      "timeframe": "1d",
+      "rows": 2103,
+      "start": "2020-09-18 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "AAVEUSDT_1d.csv": {
+      "symbol": "AAVE/USDT",
+      "timeframe": "1d",
+      "rows": 2075,
+      "start": "2020-10-16 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "FILUSDT_1d.csv": {
+      "symbol": "FIL/USDT",
+      "timeframe": "1d",
+      "rows": 2075,
+      "start": "2020-10-16 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "ETCUSDT_1d.csv": {
+      "symbol": "ETC/USDT",
+      "timeframe": "1d",
+      "rows": 2349,
+      "start": "2020-01-16 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "BCHUSDT_1d.csv": {
+      "symbol": "BCH/USDT",
+      "timeframe": "1d",
+      "rows": 2377,
+      "start": "2019-12-19 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
+    },
+    "TONUSDT_1d.csv": {
+      "symbol": "TON/USDT",
+      "timeframe": "1d",
+      "rows": 843,
+      "start": "2024-03-01 00:00:00+00:00",
+      "end": "2026-06-21 00:00:00+00:00"
     }
   }
 }
