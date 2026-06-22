@@ -113,6 +113,23 @@ REPORT_HOUR = _i("REPORT_HOUR", 9)
 # many days (also tunes never-analysed coins). 0 disables. One coin per cycle.
 REANALYZE_DAYS = _i("REANALYZE_DAYS", 30)
 
+# ---- Cross-sectional momentum (long/short) basket ----
+# Ranks a broad universe by momentum and posts an equal-weight long (and, if
+# enabled, short) basket each rebalance. The strongest research edge: ~market-
+# and funding-neutral when long/short. Independent of the per-coin watchlist.
+XSMOM_ENABLED = _b("XSMOM_ENABLED", False)
+XSMOM_UNIVERSE = [s.strip() for s in os.getenv(
+    "XSMOM_UNIVERSE",
+    "BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,BNB/USDT,ADA/USDT,DOGE/USDT,AVAX/USDT,"
+    "LINK/USDT,DOT/USDT,TRX/USDT,MATIC/USDT,LTC/USDT,BCH/USDT,ATOM/USDT,"
+    "UNI/USDT,NEAR/USDT,APT/USDT,INJ/USDT,SUI/USDT,TON/USDT,FIL/USDT,"
+    "ARB/USDT,OP/USDT,AAVE/USDT").split(",") if s.strip()]
+XSMOM_TIMEFRAME = os.getenv("XSMOM_TIMEFRAME", "1d").strip()
+XSMOM_LOOKBACK = _i("XSMOM_LOOKBACK", 30)
+XSMOM_TOP_K = _i("XSMOM_TOP_K", 5)
+XSMOM_REBALANCE_DAYS = _i("XSMOM_REBALANCE_DAYS", 7)
+XSMOM_LONG_SHORT = _b("XSMOM_LONG_SHORT", True)
+
 
 # --------------------------------------------------------------------------- #
 # Shared runtime context (one per process)
@@ -129,6 +146,7 @@ class Context:
     analyzing: set = field(default_factory=set)
     backtesting: set = field(default_factory=set)
     walkforwarding: set = field(default_factory=set)
+    xsmomming: bool = False
     # injected so tests can substitute local data
     fetch_recent_fn: callable = fetch_recent
     fetch_history_fn: callable = fetch_history
@@ -195,6 +213,16 @@ class Context:
         return ("📈 بک‌تست نموداری همهٔ ارزها شروع شد:\n"
                 + "، ".join(f"`{s}`" for s in syms)
                 + "\nنمودارها به‌ترتیب آماده‌شدن ارسال می‌شوند…")
+
+    def start_xsmom(self, announce: bool = True) -> str:
+        """Compute the current long/short momentum basket now (on demand)."""
+        if self.xsmomming:
+            return "⏳ محاسبهٔ سبد مومنتوم در حال اجراست."
+        self.xsmomming = True
+        threading.Thread(target=_xsmom_worker, args=(self, announce, True),
+                         daemon=True).start()
+        return (f"🔀 محاسبهٔ سبد مومنتوم مقطعی شروع شد ({len(XSMOM_UNIVERSE)} ارز، "
+                f"{XSMOM_TIMEFRAME})؛ نتیجه به‌زودی می‌آید…")
 
 
 # --------------------------------------------------------------------------- #
@@ -640,6 +668,56 @@ def maybe_reanalyze(ctx: Context) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Cross-sectional momentum basket (/xsmom + periodic auto-rebalance)
+# --------------------------------------------------------------------------- #
+def _xsmom_worker(ctx: Context, announce: bool = True, force: bool = False) -> None:
+    from src.live.xsmom_live import compute_basket, format_basket
+    try:
+        basket = compute_basket(ctx.fetch_recent_fn, XSMOM_UNIVERSE, XSMOM_TIMEFRAME,
+                                XSMOM_LOOKBACK, XSMOM_TOP_K, XSMOM_LONG_SHORT)
+        if basket["n"] < 2:
+            if not force:
+                return
+            ctx.notifier.send("⚠️ سبد مومنتوم: دادهٔ کافی برای هیچ ارزی به‌دست نیامد.")
+            return
+        with ctx.lock:
+            prev = ctx.state.get("xsmom")
+            ctx.state["xsmom"] = {
+                "last_rebalance": datetime.now(timezone.utc).isoformat(),
+                "asof": basket["asof"].isoformat() if hasattr(basket["asof"], "isoformat")
+                        else str(basket["asof"]),
+                "longs": basket["longs"], "shorts": basket["shorts"],
+            }
+            st.save_state(ctx.state)
+        if announce:
+            prefix = "🔄 *بازچینش خودکار سبد*\n" if not force else ""
+            ctx.notifier.send(prefix + format_basket(basket, XSMOM_TIMEFRAME,
+                              XSMOM_REBALANCE_DAYS, prev))
+        log.info("XS-mom basket: %d longs / %d shorts of %d coins.",
+                 len(basket["longs"]), len(basket["shorts"]), basket["n"])
+    except Exception as e:
+        log.exception("XS-mom basket failed: %s", e)
+        if force:
+            ctx.notifier.send(f"❌ محاسبهٔ سبد مومنتوم ناموفق بود: {e}")
+    finally:
+        ctx.xsmomming = False
+
+
+def maybe_rebalance_xsmom(ctx: Context) -> None:
+    """Auto-rebalance the long/short momentum basket every XSMOM_REBALANCE_DAYS."""
+    if not XSMOM_ENABLED or ctx.xsmomming:
+        return
+    last = ctx.state.get("xsmom", {}).get("last_rebalance")
+    if last:
+        age_days = (datetime.now(timezone.utc) - pd.Timestamp(last)).total_seconds() / 86400.0
+        if age_days < XSMOM_REBALANCE_DAYS:
+            return
+    ctx.xsmomming = True
+    log.info("XS-mom auto-rebalance triggered.")
+    threading.Thread(target=_xsmom_worker, args=(ctx, True, False), daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
 # On-demand backtest (/backtest) — runs current params over full history
 # --------------------------------------------------------------------------- #
 _PLOT_LOCK = threading.Lock()  # matplotlib is NOT thread-safe — serialise plotting
@@ -890,11 +968,15 @@ def main():
     ctx = build_context()
     symbols = list(st.watchlist(ctx.state))
     log.info("Live monitor: watching %s | poll=%ss", symbols, POLL_SECONDS)
+    xsmom_line = (f"\nسبد مومنتوم Long/Short: فعال ({len(XSMOM_UNIVERSE)} ارز، "
+                  f"{XSMOM_TIMEFRAME}، بازچینش هر {XSMOM_REBALANCE_DAYS} روز)"
+                  if XSMOM_ENABLED else "")
     ctx.notifier.send(
         "🤖 *موتور رصد چندارزی فعال شد*\n"
         f"واچ‌لیست: {', '.join(f'`{s}`' for s in symbols) or '—'}\n"
         f"تایم‌فریم: {TIMEFRAME} | بازهٔ بررسی: هر {POLL_SECONDS//60} دقیقه\n"
-        f"بازتحلیل خودکار: هر {REANALYZE_DAYS} روز\n"
+        f"بازتحلیل خودکار: هر {REANALYZE_DAYS} روز"
+        f"{xsmom_line}\n"
         f"یک گزینه را انتخاب کن یا /help را بفرست:",
         reply_markup=commands.main_menu_kb(ctx),
     )
@@ -904,6 +986,7 @@ def main():
             check_all(ctx)
             maybe_send_weekly(ctx)
             maybe_reanalyze(ctx)
+            maybe_rebalance_xsmom(ctx)
         except Exception as e:
             log.exception("Cycle error: %s", e)
         time.sleep(POLL_SECONDS)

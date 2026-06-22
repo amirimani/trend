@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--long-short", action="store_true")
     ap.add_argument("--fee", type=float, default=0.0004)
     ap.add_argument("--slippage", type=float, default=0.0005)
+    ap.add_argument("--funding", type=float, default=0.0,
+                    help="avg perpetual funding per 8h (e.g. 0.0001); longs pay / shorts receive")
     args = ap.parse_args()
 
     closes = _load_closes(args.tf)
@@ -60,6 +62,7 @@ def main():
     panel = build_panel(closes)
     ppy = periods_per_year(args.tf)
     daily = args.tf == "1d"
+    bar_hours = 24.0 if args.tf == "1d" else (168.0 if args.tf == "1w" else 4.0)
     n = len(panel)
     split = panel.index[int(n * 0.7)]
     print(f"Universe: {len(closes)} coins | {args.tf} | {panel.index[0].date()} -> "
@@ -73,7 +76,8 @@ def main():
     for lb, k, rb in itertools.product(lbs, ks, rbs):
         if k > len(closes):
             continue
-        eq = xsmom_equity(panel, lb, k, rb, args.fee, args.slippage, args.long_short)
+        eq = xsmom_equity(panel, lb, k, rb, args.fee, args.slippage, args.long_short,
+                          funding_8h=args.funding, bar_hours=bar_hours)
         is_m = _slice_metrics(eq, panel.index[0], split, ppy)
         if is_m["sharpe"] == is_m["sharpe"] and (best is None or is_m["sharpe"] > best[0]):
             best = (is_m["sharpe"], lb, k, rb, eq)

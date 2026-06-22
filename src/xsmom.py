@@ -22,8 +22,13 @@ def build_panel(closes: dict[str, pd.Series]) -> pd.DataFrame:
 
 def xsmom_equity(panel: pd.DataFrame, lookback: int, top_k: int, rebalance: int,
                  fee: float = 0.0004, slippage: float = 0.0005,
-                 long_short: bool = False, init: float = 10_000.0) -> pd.Series:
-    """Equity curve of the cross-sectional momentum portfolio (equal weight)."""
+                 long_short: bool = False, init: float = 10_000.0,
+                 funding_8h: float = 0.0, bar_hours: float = 24.0) -> pd.Series:
+    """Equity curve of the cross-sectional momentum portfolio (equal weight).
+
+    Funding (if >0) accrues each bar on net exposure: longs pay / shorts receive,
+    so a market-neutral long/short book is ~funding-free while long-only pays it.
+    """
     rets = panel.pct_change()
     cols = panel.columns
     prev_w = pd.Series(0.0, index=cols)
@@ -31,10 +36,13 @@ def xsmom_equity(panel: pd.DataFrame, lookback: int, top_k: int, rebalance: int,
     last_rebal = -10 ** 9
     out = []
     cost_rate = fee + slippage
+    fund_per_bar = funding_8h * (bar_hours / 8.0)
     for i in range(len(panel)):
         if i > 0:                                   # apply held weights to today's return
             r = rets.iloc[i].fillna(0.0)
             eq *= (1.0 + float((prev_w * r).sum()))
+            if fund_per_bar:                        # net-long exposure pays funding
+                eq *= (1.0 - float(prev_w.sum()) * fund_per_bar)
         if i >= lookback and (i - last_rebal) >= rebalance:
             mom = panel.iloc[i] / panel.iloc[i - lookback] - 1.0
             valid = mom.dropna()

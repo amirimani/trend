@@ -30,6 +30,7 @@ MENU = [
     ("backtest", "بک‌تست و نمودار یک ارز: /backtest SOL"),
     ("backtest_all", "تحلیل نموداری همهٔ ارزها"),
     ("walkforward", "آزمون Walk-Forward (expectancy واقعی): /walkforward SOL"),
+    ("xsmom", "سبد مومنتوم مقطعی Long/Short"),
     ("report", "نمایش دوبارهٔ نتیجهٔ تحلیل ذخیره‌شده: /report SOL"),
     ("add", "افزودن ارز: /add SOL/USDT"),
     ("remove", "حذف ارز: /remove SOL"),
@@ -51,7 +52,8 @@ def main_menu_kb(ctx) -> dict:
     rows = [[_btn("📋 لیست", "list"), _btn("📅 گزارش هفتگی", "summary")]]
     rows.append([_btn("⚖️ مقایسهٔ ارزها", "compare"),
                  _btn("🔬 تحلیل مجدد همه", "analyze_all")])
-    rows.append([_btn("📈 تحلیل نموداری همه", "backtest_all")])
+    rows.append([_btn("📈 تحلیل نموداری همه", "backtest_all"),
+                 _btn("🔀 سبد مومنتوم", "xsmom")])
     row = []
     for s in wl:
         flag = "🟢" if wl[s].get("enabled") else "⚪️"
@@ -386,6 +388,11 @@ def cmd_backtest_all(ctx, arg=None):
     return ctx.start_backtest_all()
 
 
+def cmd_xsmom(ctx, arg=None):
+    """Compute the current long/short cross-sectional momentum basket on demand."""
+    return ctx.start_xsmom(announce=True)
+
+
 def cmd_compare(ctx, arg=None):
     """Rank watched coins by their WALK-FORWARD expectancy (the honest metric)."""
     wl = st.watchlist(ctx.state)
@@ -474,6 +481,7 @@ _HANDLERS = {
     "backtest": cmd_backtest, "backtest_all": cmd_backtest_all,
     "backtestall": cmd_backtest_all, "walkforward": cmd_walkforward,
     "wf": cmd_walkforward, "report": cmd_report,
+    "xsmom": cmd_xsmom, "momentum": cmd_xsmom, "basket": cmd_xsmom,
 }
 
 
